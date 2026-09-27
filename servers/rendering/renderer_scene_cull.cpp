@@ -3875,6 +3875,7 @@ void RendererSceneCull::render_probes() {
 
 	SelfList<InstanceReflectionProbeData> *ref_probe = reflection_probe_render_list.first();
 	Vector<SelfList<InstanceReflectionProbeData> *> done_list;
+	LocalVector<SelfList<InstanceReflectionProbeData> *> update_always_list;
 
 	bool busy = false;
 
@@ -3901,18 +3902,38 @@ void RendererSceneCull::render_probes() {
 					busy = true; // Do not render another one of this kind.
 				} break;
 				case RSE::REFLECTION_PROBE_UPDATE_ALWAYS: {
-					int step = 0;
-					bool done = false;
-					while (!done) {
-						done = _render_reflection_probe_step(ref_probe->self()->owner, step);
-						step++;
-					}
-
+					// Rendered below, within the budget.
+					update_always_list.push_back(ref_probe);
 					done_list.push_back(ref_probe);
 				} break;
 			}
 
 			ref_probe = next;
+		}
+
+		// Each UPDATE_ALWAYS probe renders the scene 6 times and filters the result. With a
+		// budget, only the probes updated the longest ago are rendered this frame; the others
+		// keep their last reflection and are queued again by the next cull.
+		const uint32_t budget = uint32_t(MAX(0, int(GLOBAL_GET_CACHED(int, "rendering/reflections/reflection_probes/max_update_always_per_frame"))));
+		if (budget > 0 && update_always_list.size() > budget) {
+			struct OldestFirst {
+				_FORCE_INLINE_ bool operator()(const SelfList<InstanceReflectionProbeData> *p_a, const SelfList<InstanceReflectionProbeData> *p_b) const {
+					return p_a->self()->last_update_frame < p_b->self()->last_update_frame;
+				}
+			};
+			update_always_list.sort_custom<OldestFirst>();
+			update_always_list.resize(budget);
+		}
+
+		const uint64_t frame = RSG::rasterizer->get_frame_number();
+		for (SelfList<InstanceReflectionProbeData> *probe : update_always_list) {
+			int step = 0;
+			bool done = false;
+			while (!done) {
+				done = _render_reflection_probe_step(probe->self()->owner, step);
+				step++;
+			}
+			probe->self()->last_update_frame = frame;
 		}
 
 		// Now remove from our list

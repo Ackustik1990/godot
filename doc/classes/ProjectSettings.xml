@@ -3308,6 +3308,9 @@
 		<member name="rendering/reflections/reflection_atlas/reflection_size.mobile" type="int" setter="" getter="" default="128">
 			Lower-end override for [member rendering/reflections/reflection_atlas/reflection_size] on mobile devices, due to performance concerns or driver support.
 		</member>
+		<member name="rendering/reflections/reflection_probes/max_update_always_per_frame" type="int" setter="" getter="" default="0">
+			The maximum number of visible [ReflectionProbe]s with [constant ReflectionProbe.UPDATE_ALWAYS] that are updated each frame. Each update renders the scene six times, so many real-time probes quickly become the most expensive part of a frame. When more probes are visible, the ones updated the longest ago are updated first, and the others keep their last reflection until their turn comes. For example, with 8 visible real-time probes and a value of [code]2[/code], each probe is updated every 4 frames, at a quarter of the cost. If [code]0[/code], every visible real-time probe is updated every frame. Can be changed at runtime.
+		</member>
 		<member name="rendering/reflections/sky_reflections/fast_filter_high_quality" type="bool" setter="" getter="" default="false">
 			Use a higher quality variant of the fast filtering algorithm. Significantly slower than using default quality, but results in smoother reflections. Should only be used when the scene is especially detailed.
 		</member>

@@ -661,6 +661,7 @@ public:
 		SelfList<InstanceReflectionProbeData> update_list;
 
 		int render_step;
+		uint64_t last_update_frame = 0; // Frame of the last full update, used to share the budget of UPDATE_ALWAYS probes.
 
 		InstanceReflectionProbeData() :
 				update_list(this) {
