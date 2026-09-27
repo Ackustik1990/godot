@@ -874,6 +874,9 @@ private:
 	// Builds the top level acceleration structure of the ray tracing instances of the render,
 	// relative to the camera. Returns an invalid RID when there is nothing to trace.
 	RID _ray_tracing_update_tlas(const RenderDataRD *p_render_data);
+	bool _is_ray_traced_ssr_used(RID p_environment) const;
+	bool _is_ray_traced_ao_used(RID p_environment) const;
+	void _process_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform, RID p_tlas);
 	void _process_sscs(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection *p_projections, const Transform3D &p_transform, const LocalVector<int> &p_contact_shadows, const RenderShadowData *p_render_shadows, float p_taa_frame_count);
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_sscs, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);

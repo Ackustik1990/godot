@@ -3718,6 +3718,7 @@ void RenderingServer::init() {
 
 	GLOBAL_DEF_RST("rendering/ray_tracing/enabled", false);
 	GLOBAL_DEF("rendering/ray_tracing/reflections", true);
+	GLOBAL_DEF("rendering/ray_tracing/ambient_occlusion", true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/max_distance", PROPERTY_HINT_RANGE, "1,10000,0.1,or_greater,suffix:m"), 100.0);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality", PROPERTY_HINT_ENUM, "Hard (Fastest),Soft Very Low (Faster),Soft Low (Fast),Soft Medium (Average),Soft High (Slow),Soft Ultra (Slowest)"), 2);

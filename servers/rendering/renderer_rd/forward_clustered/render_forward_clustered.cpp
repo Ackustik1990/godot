@@ -1518,6 +1518,24 @@ void RenderForwardClustered::_process_ssao(Ref<RenderSceneBuffersRD> p_render_bu
 	}
 }
 
+void RenderForwardClustered::_process_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform, RID p_tlas) {
+	RENDER_TIMESTAMP("Process Ray Traced AO");
+
+	Ref<RenderBufferDataForwardClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	ERR_FAIL_COND(rb_data.is_null());
+
+	RendererRD::SSEffects::SSAOSettings settings;
+	settings.radius = environment_get_ssao_radius(p_environment);
+	settings.intensity = environment_get_ssao_intensity(p_environment);
+	settings.power = environment_get_ssao_power(p_environment);
+	settings.full_screen_size = p_render_buffers->get_internal_size();
+
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+	for (uint32_t v = 0; v < p_render_buffers->get_view_count(); v++) {
+		ss_effects->generate_ray_traced_ao(p_render_buffers, rb_data->ss_effects_data.ssao, v, p_normal_buffers[v], p_projections[v], p_transform, settings, p_tlas, frame);
+	}
+}
+
 void RenderForwardClustered::_process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform) {
 	ERR_FAIL_NULL(ss_effects);
 	ERR_FAIL_COND(p_render_buffers.is_null());
@@ -1553,12 +1571,20 @@ void RenderForwardClustered::_process_ssil(Ref<RenderSceneBuffersRD> p_render_bu
 	rb_data->ss_effects_data.ssil_last_frame_transform = transform;
 }
 
-bool RenderForwardClustered::is_ray_tracing_needed(RID p_environment) const {
+bool RenderForwardClustered::_is_ray_traced_ssr_used(RID p_environment) const {
 	return ss_effects && ss_effects->is_ray_traced_ssr_available() && GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/reflections") && p_environment.is_valid() && environment_get_ssr_enabled(p_environment);
 }
 
+bool RenderForwardClustered::_is_ray_traced_ao_used(RID p_environment) const {
+	return ss_effects && ss_effects->is_ray_traced_ao_available() && GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/ambient_occlusion") && p_environment.is_valid() && environment_get_ssao_enabled(p_environment);
+}
+
+bool RenderForwardClustered::is_ray_tracing_needed(RID p_environment) const {
+	return _is_ray_traced_ssr_used(p_environment) || _is_ray_traced_ao_used(p_environment);
+}
+
 RID RenderForwardClustered::_ray_tracing_update_tlas(const RenderDataRD *p_render_data) {
-	if (!p_render_data->ray_tracing_instances || !ss_effects->is_ray_traced_ssr_available()) {
+	if (!p_render_data->ray_tracing_instances) {
 		return RID();
 	}
 
@@ -1797,6 +1823,11 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		_render_shadow_end();
 	}
 
+	// Ray traced effects share one acceleration structure per render, built before the first of them.
+	const bool ray_traced_ao = p_use_ssao && _is_ray_traced_ao_used(p_render_data->environment);
+	const bool ray_traced_ssr = p_use_ssr && _is_ray_traced_ssr_used(p_render_data->environment);
+	const RID tlas = (rb_data.is_valid() && (ray_traced_ao || ray_traced_ssr)) ? _ray_tracing_update_tlas(p_render_data) : RID();
+
 	if (rb_data.is_valid() && ss_effects) {
 		// Note, in multiview we're allocating buffers for each eye/view we're rendering.
 		// This should allow most of the processing to happen in parallel even if we're doing
@@ -1814,7 +1845,11 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 			}
 
 			if (p_use_ssao) {
-				_process_ssao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection);
+				if (ray_traced_ao && tlas.is_valid()) {
+					_process_ray_traced_ao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, tlas);
+				} else {
+					_process_ssao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection);
+				}
 			}
 
 			if (p_use_ssil) {
@@ -1863,8 +1898,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	if (rb_data.is_valid() && ss_effects && p_use_ssr) {
 		// After the reflection probe buffer update: ray traced reflections shade the hits that
 		// aren't on screen with the probes of this frame.
-		const RID tlas = _ray_tracing_update_tlas(p_render_data);
-		_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, tlas, p_render_data->reflection_atlas);
+		_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, ray_traced_ssr ? tlas : RID(), p_render_data->reflection_atlas);
 	}
 
 	if (rb_data.is_valid()) {

@@ -324,6 +324,17 @@ SSEffects::SSEffects() {
 		}
 
 		if (MeshStorage::get_singleton() && MeshStorage::get_singleton()->is_ray_tracing_enabled()) {
+			Vector<String> ao_modes;
+			ao_modes.push_back("\n#define MODE_TRACE\n");
+			ao_modes.push_back("\n#define MODE_TEMPORAL\n");
+			ao_modes.push_back("\n#define MODE_BLUR\n");
+			ssao_ray_query.shader.initialize(ao_modes);
+			ssao_ray_query.shader_version = ssao_ray_query.shader.version_create();
+			for (int i = 0; i < SSAO_RAY_QUERY_MODE_MAX; i++) {
+				ssao_ray_query.pipelines[i].create_compute_pipeline(ssao_ray_query.shader.version_get_shader(ssao_ray_query.shader_version, i));
+			}
+			ssao_ray_query.available = true;
+
 			Vector<String> ray_query_modes;
 			ray_query_modes.push_back("\n");
 
@@ -469,6 +480,15 @@ SSEffects::~SSEffects() {
 			ssr.hiz_pipelines[i].free();
 		}
 		ssr.ssr_pipeline.free();
+		if (ssao_ray_query.available) {
+			if (ssao_ray_query.reprojection_ubo.is_valid()) {
+				RD::get_singleton()->free_rid(ssao_ray_query.reprojection_ubo);
+			}
+			for (int i = 0; i < SSAO_RAY_QUERY_MODE_MAX; i++) {
+				ssao_ray_query.pipelines[i].free();
+			}
+			ssao_ray_query.shader.version_free(ssao_ray_query.shader_version);
+		}
 		if (ssr.ray_query_available) {
 			RD::get_singleton()->free_rid(ssr.ray_query_dummy_buffer);
 			ssr.ray_query_pipeline.free();
@@ -1175,6 +1195,125 @@ void SSEffects::ssao_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers
 	p_render_buffers->create_texture(RB_SCOPE_SSAO, RB_IMPORTANCE_MAP, RD::DATA_FORMAT_R8_UNORM, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, half_size);
 	p_render_buffers->create_texture(RB_SCOPE_SSAO, RB_IMPORTANCE_PONG, RD::DATA_FORMAT_R8_UNORM, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, half_size);
 	p_render_buffers->create_texture(RB_SCOPE_SSAO, RB_FINAL, RD::DATA_FORMAT_R8_UNORM, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1);
+}
+
+void SSEffects::generate_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, uint32_t p_view, RID p_normal_buffer, const Projection &p_projection, const Transform3D &p_camera_transform, const SSAOSettings &p_settings, RID p_tlas, uint64_t p_frame) {
+	ERR_FAIL_COND(!ssao_ray_query.available || p_tlas.is_null());
+	ERR_FAIL_UNSIGNED_INDEX(p_view, 2u);
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	RD *rd = RD::get_singleton();
+	const RID nearest_sampler = MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	const RID linear_sampler = MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+
+	// The same final texture as SSAO, which the scene shader samples, plus the accumulation history
+	// (ping-pong) and a buffer for the blur.
+	const uint32_t usage = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+	const StringName history_names[2] = { SNAME("ray_traced_history_0"), SNAME("ray_traced_history_1") };
+	bool history_valid = p_render_buffers->has_texture(RB_SCOPE_SSAO, history_names[0]);
+	p_render_buffers->create_texture(RB_SCOPE_SSAO, RB_FINAL, RD::DATA_FORMAT_R8_UNORM, usage, RD::TEXTURE_SAMPLES_1);
+	p_render_buffers->create_texture(RB_SCOPE_SSAO, SNAME("ray_traced_raw"), RD::DATA_FORMAT_R8_UNORM, usage, RD::TEXTURE_SAMPLES_1);
+	p_render_buffers->create_texture(RB_SCOPE_SSAO, SNAME("ray_traced_blur"), RD::DATA_FORMAT_R8_UNORM, usage, RD::TEXTURE_SAMPLES_1);
+	for (const StringName &name : history_names) {
+		p_render_buffers->create_texture(RB_SCOPE_SSAO, name, RD::DATA_FORMAT_R16G16_SFLOAT, usage, RD::TEXTURE_SAMPLES_1);
+	}
+
+	// Swap the history once per frame (all views of a frame use the same index).
+	if (p_view == 0) {
+		// A gap in the frames (the effect was off) makes the history stale.
+		history_valid = history_valid && p_ssao_buffers.ray_traced_history_frame + 1 == p_frame;
+		if (history_valid) {
+			p_ssao_buffers.ray_traced_history_index ^= 1;
+		}
+		p_ssao_buffers.ray_traced_history_frame = p_frame;
+	} else {
+		history_valid = history_valid && p_ssao_buffers.ray_traced_history_frame == p_frame;
+	}
+
+	const Size2i size = p_render_buffers->get_internal_size();
+	const RID depth = p_render_buffers->get_depth_texture(p_view);
+	const RID raw = p_render_buffers->get_texture_slice(RB_SCOPE_SSAO, SNAME("ray_traced_raw"), p_view, 0);
+	const RID blur = p_render_buffers->get_texture_slice(RB_SCOPE_SSAO, SNAME("ray_traced_blur"), p_view, 0);
+	const RID final = p_render_buffers->get_texture_slice(RB_SCOPE_SSAO, RB_FINAL, p_view, 0);
+	const uint32_t history_index = p_ssao_buffers.ray_traced_history_index;
+	const RID previous_history = p_render_buffers->get_texture_slice(RB_SCOPE_SSAO, history_names[history_index ^ 1], p_view, 0);
+	const RID history = p_render_buffers->get_texture_slice(RB_SCOPE_SSAO, history_names[history_index], p_view, 0);
+
+	Projection correction;
+	correction.set_depth_correction(true);
+	const Projection projection = correction * p_projection;
+
+	// From the view space of this frame to the view and clip space of the frame in the history.
+	SSAORayQueryReprojection reprojection;
+	store_camera(Projection(p_ssao_buffers.ray_traced_last_transform.affine_inverse() * p_camera_transform), reprojection.current_to_previous_view);
+	store_camera(p_ssao_buffers.ray_traced_last_projections[p_view], reprojection.previous_projection);
+	if (ssao_ray_query.reprojection_ubo.is_null()) {
+		ssao_ray_query.reprojection_ubo = rd->uniform_buffer_create(sizeof(SSAORayQueryReprojection));
+	}
+	rd->buffer_update(ssao_ray_query.reprojection_ubo, 0, sizeof(SSAORayQueryReprojection), &reprojection);
+	p_ssao_buffers.ray_traced_last_projections[p_view] = projection;
+	if (p_view == p_render_buffers->get_view_count() - 1) {
+		p_ssao_buffers.ray_traced_last_transform = p_camera_transform;
+	}
+
+	SSAORayQueryPushConstant push_constant;
+	memset(&push_constant, 0, sizeof(push_constant));
+	store_camera(projection.inverse(), push_constant.inv_projection);
+	push_constant.screen_size[0] = size.width;
+	push_constant.screen_size[1] = size.height;
+	push_constant.radius = MAX(p_settings.radius, 0.01f);
+	push_constant.intensity = p_settings.intensity;
+	push_constant.power = p_settings.power;
+	push_constant.frame = uint32_t(p_frame);
+	push_constant.ray_count = 2;
+
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ nearest_sampler, depth });
+	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>{ nearest_sampler, p_normal_buffer });
+
+	rd->draw_command_begin_label("Ray Traced AO");
+
+	{
+		const RID shader = ssao_ray_query.shader.version_get_shader(ssao_ray_query.shader_version, SSAO_RAY_QUERY_MODE_TRACE);
+		RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 2, p_tlas);
+		RD::Uniform u_dest(RD::UNIFORM_TYPE_IMAGE, 3, raw);
+		RD::ComputeListID compute_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(compute_list, ssao_ray_query.pipelines[SSAO_RAY_QUERY_MODE_TRACE].get_rid());
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_depth, u_normal, u_tlas, u_dest), 0);
+		rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+		rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+		rd->compute_list_end();
+	}
+
+	{
+		push_constant.flags = history_valid ? SSAO_RAY_QUERY_FLAG_HISTORY_VALID : 0;
+		const RID shader = ssao_ray_query.shader.version_get_shader(ssao_ray_query.shader_version, SSAO_RAY_QUERY_MODE_TEMPORAL);
+		RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>{ nearest_sampler, raw });
+		RD::Uniform u_history(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ linear_sampler, previous_history });
+		RD::Uniform u_dest(RD::UNIFORM_TYPE_IMAGE, 4, history);
+		RD::Uniform u_reprojection(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 5, ssao_ray_query.reprojection_ubo);
+		RD::ComputeListID compute_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(compute_list, ssao_ray_query.pipelines[SSAO_RAY_QUERY_MODE_TEMPORAL].get_rid());
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_depth, u_normal, u_source, u_history, u_dest, u_reprojection), 0);
+		rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+		rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+		rd->compute_list_end();
+	}
+
+	const RID shader = ssao_ray_query.shader.version_get_shader(ssao_ray_query.shader_version, SSAO_RAY_QUERY_MODE_BLUR);
+	const RID blur_source[2] = { history, blur };
+	const RID blur_dest[2] = { blur, final };
+	for (int pass = 0; pass < 2; pass++) {
+		push_constant.flags = pass == 1 ? SSAO_RAY_QUERY_FLAG_BLUR_VERTICAL : 0;
+		RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>{ nearest_sampler, blur_source[pass] });
+		RD::Uniform u_dest(RD::UNIFORM_TYPE_IMAGE, 3, blur_dest[pass]);
+		RD::ComputeListID compute_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(compute_list, ssao_ray_query.pipelines[SSAO_RAY_QUERY_MODE_BLUR].get_rid());
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_depth, u_normal, u_source, u_dest), 0);
+		rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+		rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+		rd->compute_list_end();
+	}
+
+	rd->draw_command_end_label();
 }
 
 void SSEffects::generate_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, uint32_t p_view, RID p_normal_buffer, const Projection &p_projection, const SSAOSettings &p_settings) {

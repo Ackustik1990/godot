@@ -43,6 +43,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/ssao_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao_importance_map.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao_interleave.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/ssao_ray_query.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssil.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssil_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssil_importance_map.glsl.gen.h"
@@ -137,6 +138,12 @@ public:
 		int buffer_height;
 		int half_buffer_width;
 		int half_buffer_height;
+
+		// Ray traced AO accumulates over frames: camera of the frame stored in the history.
+		Projection ray_traced_last_projections[2];
+		Transform3D ray_traced_last_transform;
+		uint32_t ray_traced_history_index = 0;
+		uint64_t ray_traced_history_frame = 0;
 	};
 
 	struct SSAOSettings {
@@ -152,6 +159,11 @@ public:
 
 	void ssao_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, const SSAOSettings &p_settings);
 	void generate_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, uint32_t p_view, RID p_normal_buffer, const Projection &p_projection, const SSAOSettings &p_settings);
+
+	// Ray traced ambient occlusion against p_tlas (an acceleration structure of the scene in view
+	// space), written to the same texture as SSAO. p_frame varies the ray pattern over time.
+	void generate_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, uint32_t p_view, RID p_normal_buffer, const Projection &p_projection, const Transform3D &p_camera_transform, const SSAOSettings &p_settings, RID p_tlas, uint64_t p_frame);
+	bool is_ray_traced_ao_available() const { return ssao_ray_query.available; }
 
 	/* Screen Space Reflection */
 	void ssr_set_half_size(bool p_half_size);
@@ -546,6 +558,44 @@ private:
 		RID resolve_shader_version;
 		PipelineDeferredRD resolve_pipeline;
 	} ssr;
+
+	/* Ray traced ambient occlusion */
+
+	enum SSAORayQueryMode {
+		SSAO_RAY_QUERY_MODE_TRACE,
+		SSAO_RAY_QUERY_MODE_TEMPORAL,
+		SSAO_RAY_QUERY_MODE_BLUR,
+		SSAO_RAY_QUERY_MODE_MAX
+	};
+
+	enum SSAORayQueryFlags {
+		SSAO_RAY_QUERY_FLAG_BLUR_VERTICAL = 1,
+		SSAO_RAY_QUERY_FLAG_HISTORY_VALID = 2,
+	};
+
+	struct SSAORayQueryReprojection {
+		float current_to_previous_view[16];
+		float previous_projection[16];
+	};
+
+	struct SSAORayQueryPushConstant {
+		float inv_projection[16];
+		int32_t screen_size[2];
+		float radius;
+		float intensity;
+		float power;
+		uint32_t frame;
+		uint32_t ray_count;
+		uint32_t flags;
+	};
+
+	struct SSAORayQuery {
+		SsaoRayQueryShaderRD shader;
+		RID shader_version;
+		PipelineDeferredRD pipelines[SSAO_RAY_QUERY_MODE_MAX];
+		RID reprojection_ubo;
+		bool available = false;
+	} ssao_ray_query;
 
 	/* Screen Space Shadows */
 
