@@ -851,6 +851,16 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 	uint32_t repeats = 0;
 	GeometryInstanceSurfaceDataCache *prev_surface = nullptr;
 	for (uint32_t i = 0; i < element_total; i++) {
+		// Elements are sorted by material, so their surfaces and instances are scattered in
+		// memory and this loop is bound by cache misses. Prefetch a few iterations ahead:
+		// first the surface cache, then (once it's likely resident) its owner instance.
+		if (i + 8 < element_total) {
+			RENDER_PREFETCH(rl->elements[i + 8 + p_offset]);
+		}
+		if (i + 4 < element_total) {
+			RENDER_PREFETCH(rl->elements[i + 4 + p_offset]->owner);
+		}
+
 		GeometryInstanceSurfaceDataCache *surface = rl->elements[i + p_offset];
 		GeometryInstanceForwardClustered *inst = surface->owner;
 
@@ -885,14 +895,9 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 		instance_data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 		instance_data.set_lightmap_uv_scale(inst->lightmap_uv_scale);
 
-		AABB surface_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
-		uint64_t format = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(surface->surface);
-		Vector4 uv_scale = Vector4(0.0, 0.0, 0.0, 0.0);
-
-		if (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
-			surface_aabb = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_aabb(surface->surface);
-			uv_scale = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_uv_scale(surface->surface);
-		}
+		// Identity AABB and zero UV scale unless the surface uses compressed attributes.
+		const AABB &surface_aabb = surface->compressed_aabb;
+		const Vector4 &uv_scale = surface->compressed_uv_scale;
 
 		uint32_t material_feedback_index = UINT32_MAX;
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
@@ -985,7 +990,16 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	//fill list
 
-	for (int i = 0; i < (int)p_render_data->instances->size(); i++) {
+	const int instance_count = (int)p_render_data->instances->size();
+	for (int i = 0; i < instance_count; i++) {
+		// Hide the latency of the pointer chasing below, see _fill_instance_data().
+		if (i + 8 < instance_count) {
+			RENDER_PREFETCH((*p_render_data->instances)[i + 8]);
+		}
+		if (i + 4 < instance_count) {
+			RENDER_PREFETCH(static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i + 4])->surface_caches);
+		}
+
 		GeometryInstanceForwardClustered *inst = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
 
 		Vector3 center = inst->transform.origin;
@@ -4703,6 +4717,11 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
+
+	if (mesh_storage->mesh_surface_get_format(sdcache->surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+		sdcache->compressed_aabb = mesh_storage->mesh_surface_get_aabb(sdcache->surface);
+		sdcache->compressed_uv_scale = mesh_storage->mesh_surface_get_uv_scale(sdcache->surface);
+	}
 
 	if (virtual_geometry && ginstance->data->base_type == RSE::INSTANCE_MESH && sdcache->primitive == RSE::PRIMITIVE_TRIANGLES && !(flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) && mesh_storage->mesh_surface_has_virtual_geometry(sdcache->surface)) {
 		sdcache->flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_VIRTUAL_GEOMETRY;

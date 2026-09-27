@@ -54,7 +54,7 @@
 #endif
 
 struct FrustumCullSIMD {
-	static constexpr uint32_t MAX_PLANES = 8;
+	static constexpr uint32_t MAX_PLANES = 16;
 
 	float normal_x[MAX_PLANES];
 	float normal_y[MAX_PLANES];

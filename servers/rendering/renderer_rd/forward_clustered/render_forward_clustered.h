@@ -50,6 +50,16 @@
 
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
 
+// Software prefetch for pointer chasing loops over render lists.
+#if defined(__GNUC__) || defined(__clang__)
+#define RENDER_PREFETCH(m_ptr) __builtin_prefetch((const void *)(m_ptr))
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#define RENDER_PREFETCH(m_ptr) _mm_prefetch((const char *)(m_ptr), _MM_HINT_T0)
+#else
+#define RENDER_PREFETCH(m_ptr) ((void)(m_ptr))
+#endif
+
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
@@ -579,6 +589,11 @@ private:
 		// Virtual geometry job of the current main view batch, shared by the depth, opaque and motion passes.
 		uint64_t vg_batch_id = 0;
 		uint32_t vg_draw = 0;
+
+		// Copied from the mesh surface when the cache is built, so filling the instance
+		// buffer doesn't have to touch the mesh storage for every element.
+		AABB compressed_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
+		Vector4 compressed_uv_scale;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
 		GeometryInstanceForwardClustered *owner = nullptr;
