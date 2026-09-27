@@ -1553,7 +1553,63 @@ void RenderForwardClustered::_process_ssil(Ref<RenderSceneBuffersRD> p_render_bu
 	rb_data->ss_effects_data.ssil_last_frame_transform = transform;
 }
 
-void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform) {
+bool RenderForwardClustered::is_ray_tracing_needed(RID p_environment) const {
+	return ss_effects && ss_effects->is_ray_traced_ssr_available() && GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/reflections") && p_environment.is_valid() && environment_get_ssr_enabled(p_environment);
+}
+
+RID RenderForwardClustered::_ray_tracing_update_tlas(const RenderDataRD *p_render_data) {
+	if (!p_render_data->ray_tracing_instances || !ss_effects->is_ray_traced_ssr_available()) {
+		return RID();
+	}
+
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	// Rays are traced in view space, which also keeps precision high around the camera.
+	const Transform3D world_to_view = p_render_data->scene_data->cam_transform.affine_inverse();
+	const PagedArray<RenderGeometryInstance *> &instances = *p_render_data->ray_tracing_instances;
+
+	ray_tracing_tlas_instances.clear();
+	for (uint32_t i = 0; i < instances.size(); i++) {
+		const GeometryInstanceForwardClustered *ginstance = static_cast<const GeometryInstanceForwardClustered *>(instances[i]);
+		const Transform3D transform = world_to_view * (ginstance->store_transform_cache ? ginstance->transform : Transform3D());
+		for (const GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches; surf; surf = surf->next) {
+			// Only opaque surfaces: hits are validated against the depth buffer, which transparent ones don't write.
+			if (!(surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
+				continue;
+			}
+			const RID blas = mesh_storage->mesh_surface_get_blas(surf->surface);
+			if (blas.is_null()) {
+				continue;
+			}
+			RD::AccelerationStructureInstance instance;
+			instance.transform = transform;
+			instance.blas = blas;
+			instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+			ray_tracing_tlas_instances.push_back(instance);
+		}
+	}
+
+	if (ray_tracing_tlas_instances.is_empty()) {
+		return RID();
+	}
+
+	if (ray_tracing_tlas.is_null() || ray_tracing_tlas_capacity < ray_tracing_tlas_instances.size()) {
+		if (ray_tracing_tlas.is_valid()) {
+			RD::get_singleton()->free_rid(ray_tracing_tlas);
+		}
+		ray_tracing_tlas_capacity = Math::next_power_of_2(MAX(ray_tracing_tlas_instances.size(), 64u));
+		// Rebuilt every frame, since instances are relative to the camera.
+		ray_tracing_tlas = RD::get_singleton()->tlas_create(ray_tracing_tlas_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+		ERR_FAIL_COND_V(ray_tracing_tlas.is_null(), RID());
+	}
+
+	RD::get_singleton()->draw_command_begin_label("Ray Tracing TLAS");
+	const Error err = RD::get_singleton()->tlas_build(ray_tracing_tlas, Span<RD::AccelerationStructureInstance>(ray_tracing_tlas_instances.ptr(), ray_tracing_tlas_instances.size()));
+	RD::get_singleton()->draw_command_end_label();
+	ERR_FAIL_COND_V(err != OK, RID());
+	return ray_tracing_tlas;
+}
+
+void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform, RID p_tlas, RID p_reflection_atlas) {
 	ERR_FAIL_NULL(ss_effects);
 	ERR_FAIL_COND(p_render_buffers.is_null());
 
@@ -1578,7 +1634,17 @@ void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 	rb_data->ss_effects_data.ssr_last_frame_transform = p_transform;
 
-	ss_effects->screen_space_reflection(p_render_buffers, rb_data->ss_effects_data.ssr, p_normal_slices, environment_get_ssr_max_steps(p_environment), environment_get_ssr_fade_in(p_environment), environment_get_ssr_fade_out(p_environment), environment_get_ssr_depth_tolerance(p_environment), p_projections, reprojections, p_eye_offsets, *copy_effects);
+	RendererRD::RayTracedReflectionProbes probes;
+	if (p_tlas.is_valid() && p_reflection_atlas.is_valid()) {
+		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+		probes.buffer = light_storage->get_reflection_probe_buffer();
+		probes.count = light_storage->get_reflection_probe_count();
+		probes.atlas = light_storage->reflection_atlas_get_texture(p_reflection_atlas);
+		const float border_size = light_storage->reflection_atlas_get_border_size(p_reflection_atlas);
+		probes.atlas_border_size = Size2(border_size, 1.0f - border_size * 2.0f);
+	}
+
+	ss_effects->screen_space_reflection(p_render_buffers, rb_data->ss_effects_data.ssr, p_normal_slices, environment_get_ssr_max_steps(p_environment), environment_get_ssr_fade_in(p_environment), environment_get_ssr_fade_out(p_environment), environment_get_ssr_depth_tolerance(p_environment), p_projections, reprojections, p_eye_offsets, *copy_effects, p_tlas, GLOBAL_GET_CACHED(float, "rendering/ray_tracing/max_distance"), probes);
 }
 
 void RenderForwardClustered::_process_sscs(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection *p_projections, const Transform3D &p_transform, const LocalVector<int> &p_contact_shadows, const RenderShadowData *p_render_shadows, const float p_taa_frame_count) {
@@ -1759,10 +1825,6 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		if (p_use_sscs) {
 			_process_sscs(rb, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, p_render_data->contact_shadows, p_render_data->render_shadows, p_render_data->scene_data->taa_frame_count);
 		}
-
-		if (p_use_ssr) {
-			_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform);
-		}
 	}
 
 	RENDER_TIMESTAMP("Pre Opaque Render");
@@ -1796,6 +1858,13 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	if (current_cluster_builder) {
 		current_cluster_builder->bake_cluster();
+	}
+
+	if (rb_data.is_valid() && ss_effects && p_use_ssr) {
+		// After the reflection probe buffer update: ray traced reflections shade the hits that
+		// aren't on screen with the probes of this frame.
+		const RID tlas = _ray_tracing_update_tlas(p_render_data);
+		_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, tlas, p_render_data->reflection_atlas);
 	}
 
 	if (rb_data.is_valid()) {
@@ -5859,6 +5928,11 @@ RenderForwardClustered::~RenderForwardClustered() {
 	if (virtual_geometry) {
 		memdelete(virtual_geometry);
 		virtual_geometry = nullptr;
+	}
+
+	if (ray_tracing_tlas.is_valid()) {
+		RD::get_singleton()->free_rid(ray_tracing_tlas);
+		ray_tracing_tlas = RID();
 	}
 
 	_free_native_upscale_calls();

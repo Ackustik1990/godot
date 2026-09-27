@@ -835,6 +835,10 @@ private:
 	void _virtual_geometry_setup_shadows();
 	void _virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array, RID p_disoccluded_command_buffer = RID());
 
+public:
+	virtual bool is_ray_tracing_needed(RID p_environment) const override;
+
+private:
 	/* Cluster builder */
 
 	ClusterBuilderSharedDataRD cluster_builder_shared;
@@ -859,7 +863,17 @@ private:
 	/* Render Scene */
 	void _process_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections);
 	void _process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform);
-	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform);
+	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform, RID p_tlas = RID(), RID p_reflection_atlas = RID());
+
+	/* Ray tracing */
+
+	RID ray_tracing_tlas;
+	uint32_t ray_tracing_tlas_capacity = 0;
+	LocalVector<RD::AccelerationStructureInstance> ray_tracing_tlas_instances;
+
+	// Builds the top level acceleration structure of the ray tracing instances of the render,
+	// relative to the camera. Returns an invalid RID when there is nothing to trace.
+	RID _ray_tracing_update_tlas(const RenderDataRD *p_render_data);
 	void _process_sscs(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection *p_projections, const Transform3D &p_transform, const LocalVector<int> &p_contact_shadows, const RenderShadowData *p_render_shadows, float p_taa_frame_count);
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_sscs, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);

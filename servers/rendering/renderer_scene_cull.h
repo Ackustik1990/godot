@@ -898,6 +898,9 @@ public:
 	PagedArray<Instance *> instance_cull_result;
 	PagedArray<Instance *> instance_shadow_cull_result;
 
+	// Instances around the camera traced by ray traced effects (not culled against the frustum).
+	PagedArray<RenderGeometryInstance *> ray_tracing_instances;
+
 	struct InstanceCullResult {
 		PagedArray<RenderGeometryInstance *> geometry_instances;
 		PagedArray<Instance *> lights;

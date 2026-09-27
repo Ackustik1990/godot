@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_downsample.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_filter.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_hiz.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_ray_query.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ss_effects_downsample.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao.glsl.gen.h"
@@ -76,6 +77,14 @@ class RenderSceneBuffersRD;
 namespace RendererRD {
 
 class CopyEffects;
+
+// Reflection probes of the frame, used by ray traced reflections to shade hits that aren't on screen.
+struct RayTracedReflectionProbes {
+	RID buffer;
+	uint32_t count = 0;
+	RID atlas;
+	Size2 atlas_border_size;
+};
 
 class SSEffects {
 private:
@@ -154,7 +163,11 @@ public:
 	};
 
 	void ssr_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RD::DataFormat p_color_format);
-	void screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RID *p_normal_roughness_slices, int p_max_steps, float p_fade_in, float p_fade_out, float p_tolerance, const Projection *p_projections, const Projection *p_reprojections, const Vector3 *p_eye_offsets, RendererRD::CopyEffects &p_copy_effects);
+	// With p_tlas (an acceleration structure of the scene in view space, see
+	// is_ray_traced_ssr_available()), reflection rays are traced against the scene up to
+	// p_max_distance instead of being marched through the depth buffer.
+	void screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RID *p_normal_roughness_slices, int p_max_steps, float p_fade_in, float p_fade_out, float p_tolerance, const Projection *p_projections, const Projection *p_reprojections, const Vector3 *p_eye_offsets, RendererRD::CopyEffects &p_copy_effects, RID p_tlas = RID(), float p_max_distance = 0.0, const RayTracedReflectionProbes &p_probes = RayTracedReflectionProbes());
+	bool is_ray_traced_ssr_available() const { return ssr.ray_query_available; }
 
 	/* subsurface scattering */
 	void sss_set_quality(RSE::SubSurfaceScatteringQuality p_quality);
@@ -481,6 +494,18 @@ private:
 		int32_t pad[3];
 	};
 
+	struct ScreenSpaceReflectionRayQueryPushConstant {
+		int32_t screen_size[2];
+		int32_t mipmaps;
+		float max_distance;
+		float pad[2];
+		float depth_tolerance;
+		int32_t orthogonal;
+		uint32_t view_index;
+		uint32_t reflection_count;
+		float reflection_atlas_border_size[2];
+	};
+
 	struct ScreenSpaceReflectionFilterPushConstant {
 		int32_t screen_size[2];
 		uint32_t mip_level;
@@ -505,6 +530,13 @@ private:
 		RID ssr_shader_version;
 		PipelineDeferredRD ssr_pipeline;
 		RID ubo;
+
+		// Ray traced trace pass, only created when meshes have acceleration structures.
+		ScreenSpaceReflectionRayQueryShaderRD ray_query_shader;
+		RID ray_query_shader_version;
+		PipelineDeferredRD ray_query_pipeline;
+		RID ray_query_dummy_buffer; // Bound when there are no reflection probes.
+		bool ray_query_available = false;
 
 		ScreenSpaceReflectionFilterShaderRD filter_shader;
 		RID filter_shader_version;

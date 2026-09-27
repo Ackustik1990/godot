@@ -143,6 +143,12 @@ private:
 			// Cluster hierarchy for GPU-driven cluster LOD rendering (cluster_count == 0 when unused).
 			VirtualGeometryPool::Allocation virtual_geometry;
 
+			// Ray tracing: the bottom level acceleration structure, built on first use. Positions come
+			// from the vertex buffer, or from a float copy when they are compressed.
+			bool ray_tracing_eligible = false;
+			RID ray_tracing_position_buffer; // Only valid for the float copy.
+			RID ray_tracing_blas;
+
 			RID material;
 
 			uint32_t render_index = 0;
@@ -185,6 +191,7 @@ private:
 	mutable RID_Owner<Mesh, true> mesh_owner;
 
 	VirtualGeometryPool virtual_geometry_pool;
+	bool ray_tracing_enabled = false;
 
 	/* Mesh Instance API */
 
@@ -522,6 +529,12 @@ public:
 	}
 
 	VirtualGeometryPool *get_virtual_geometry_pool() { return &virtual_geometry_pool; }
+
+	// True when meshes are created with acceleration structure inputs (project setting and GPU support).
+	bool is_ray_tracing_enabled() const { return ray_tracing_enabled; }
+	// Bottom level acceleration structure of a static triangle surface, built on first use (render
+	// thread only). Returns an invalid RID for surfaces that can't be ray traced.
+	RID mesh_surface_get_blas(void *p_surface);
 
 	_FORCE_INLINE_ RID mesh_surface_get_index_array(void *p_surface, uint32_t p_lod) const {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);

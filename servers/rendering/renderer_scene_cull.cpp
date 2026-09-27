@@ -3722,8 +3722,38 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		prev_camera_data = RSG::viewport->viewport_get_prev_camera_data(p_viewport);
 	}
 
+	// Rays leave the view frustum, so ray traced effects get every mesh instance around the camera.
+	ray_tracing_instances.clear();
+	const PagedArray<RenderGeometryInstance *> *ray_tracing = nullptr;
+	if (p_reflection_probe.is_null() && scene_render->is_ray_tracing_needed(p_environment)) {
+		RENDER_TIMESTAMP("Cull Ray Tracing Instances");
+		const real_t distance = MAX(real_t(GLOBAL_GET_CACHED(real_t, "rendering/ray_tracing/max_distance")), real_t(0.01));
+		const AABB aabb(camera_position - Vector3(distance, distance, distance), Vector3(distance, distance, distance) * 2.0);
+
+		struct CullRayTracing {
+			PagedArray<RenderGeometryInstance *> *instances = nullptr;
+			uint32_t layers = 0;
+			_FORCE_INLINE_ bool operator()(void *p_data) {
+				const Instance *instance = static_cast<const Instance *>(p_data);
+				if (instance->visible && instance->base_type == RSE::INSTANCE_MESH && (instance->layer_mask & layers) && instance->base_data) {
+					const InstanceGeometryData *geometry = static_cast<const InstanceGeometryData *>(instance->base_data);
+					if (geometry->geometry_instance) {
+						instances->push_back(geometry->geometry_instance);
+					}
+				}
+				return false;
+			}
+		};
+
+		CullRayTracing cull_ray_tracing;
+		cull_ray_tracing.instances = &ray_tracing_instances;
+		cull_ray_tracing.layers = p_visible_layers;
+		scenario->indexers[Scenario::INDEXER_GEOMETRY].aabb_query(aabb, cull_ray_tracing);
+		ray_tracing = &ray_tracing_instances;
+	}
+
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, ray_tracing);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
@@ -4539,6 +4569,7 @@ RendererSceneCull::RendererSceneCull() {
 
 	instance_cull_result.set_page_pool(&instance_cull_page_pool);
 	instance_shadow_cull_result.set_page_pool(&instance_cull_page_pool);
+	ray_tracing_instances.set_page_pool(&geometry_instance_cull_page_pool);
 
 	for (uint32_t i = 0; i < MAX_UPDATE_SHADOWS; i++) {
 		render_shadow_data[i].instances.set_page_pool(&geometry_instance_cull_page_pool);
@@ -4569,6 +4600,7 @@ RendererSceneCull::RendererSceneCull() {
 
 RendererSceneCull::~RendererSceneCull() {
 	instance_cull_result.reset();
+	ray_tracing_instances.reset();
 	instance_shadow_cull_result.reset();
 
 	for (uint32_t i = 0; i < MAX_UPDATE_SHADOWS; i++) {

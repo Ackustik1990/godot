@@ -33,7 +33,9 @@
 #include "core/config/project_settings.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
+#include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
 using namespace RendererRD;
@@ -321,6 +323,17 @@ SSEffects::SSEffects() {
 			ssr.ssr_pipeline.create_compute_pipeline(ssr.ssr_shader.version_get_shader(ssr.ssr_shader_version, 0));
 		}
 
+		if (MeshStorage::get_singleton() && MeshStorage::get_singleton()->is_ray_tracing_enabled()) {
+			Vector<String> ray_query_modes;
+			ray_query_modes.push_back("\n");
+
+			ssr.ray_query_shader.initialize(ray_query_modes);
+			ssr.ray_query_shader_version = ssr.ray_query_shader.version_create();
+			ssr.ray_query_pipeline.create_compute_pipeline(ssr.ray_query_shader.version_get_shader(ssr.ray_query_shader_version, 0));
+			ssr.ray_query_dummy_buffer = RD::get_singleton()->storage_buffer_create(256);
+			ssr.ray_query_available = true;
+		}
+
 		{
 			Vector<String> ssr_filter_modes;
 			ssr_filter_modes.push_back("\n");
@@ -456,6 +469,11 @@ SSEffects::~SSEffects() {
 			ssr.hiz_pipelines[i].free();
 		}
 		ssr.ssr_pipeline.free();
+		if (ssr.ray_query_available) {
+			RD::get_singleton()->free_rid(ssr.ray_query_dummy_buffer);
+			ssr.ray_query_pipeline.free();
+			ssr.ray_query_shader.version_free(ssr.ray_query_shader_version);
+		}
 		ssr.filter_pipeline.free();
 		ssr.resolve_pipeline.free();
 
@@ -1499,7 +1517,9 @@ void SSEffects::ssr_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 }
 
-void SSEffects::screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RID *p_normal_roughness_slices, int p_max_steps, float p_fade_in, float p_fade_out, float p_tolerance, const Projection *p_projections, const Projection *p_reprojections, const Vector3 *p_eye_offsets, RendererRD::CopyEffects &p_copy_effects) {
+void SSEffects::screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RID *p_normal_roughness_slices, int p_max_steps, float p_fade_in, float p_fade_out, float p_tolerance, const Projection *p_projections, const Projection *p_reprojections, const Vector3 *p_eye_offsets, RendererRD::CopyEffects &p_copy_effects, RID p_tlas, float p_max_distance, const RayTracedReflectionProbes &p_probes) {
+	const bool ray_traced = p_tlas.is_valid() && ssr.ray_query_available;
+
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	ERR_FAIL_NULL(uniform_set_cache);
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
@@ -1594,7 +1614,8 @@ void SSEffects::screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffe
 
 	RD::get_singleton()->draw_command_begin_label("SSR HI-Z");
 
-	for (uint32_t v = 0; v < view_count; v++) {
+	// Ray tracing only needs the full resolution depth, not the hierarchy used for marching.
+	for (uint32_t v = 0; v < view_count && !ray_traced; v++) {
 		for (uint32_t m = 1; m < p_ssr_buffers.mipmaps; m++) {
 			ScreenSpaceReflectionHizPushConstant push_constant;
 			push_constant.screen_size[0] = MAX(1, p_ssr_buffers.size.width >> m);
@@ -1647,7 +1668,53 @@ void SSEffects::screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffe
 
 	RID ssr_shader = ssr.ssr_shader.version_get_shader(ssr.ssr_shader_version, 0);
 
-	for (uint32_t v = 0; v < view_count; v++) {
+	for (uint32_t v = 0; v < view_count && ray_traced; v++) {
+		RID last_frame_texture = p_render_buffers->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 0);
+		if (ssr_half_size && RD::get_singleton()->texture_size(last_frame_texture) != p_ssr_buffers.size) {
+			// SSIL is likely also enabled. The texture we need is in the second mipmap in this case.
+			last_frame_texture = p_render_buffers->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 1);
+		}
+
+		RID depth_texture = p_render_buffers->get_texture_slice(RB_SCOPE_SSR, RB_HIZ, v, 0);
+		RID normal_roughness_texture = ssr_half_size ? p_render_buffers->get_texture_slice(RB_SCOPE_SSR, RB_NORMAL_ROUGHNESS, v, 0) : p_normal_roughness_slices[v];
+		RID ssr_texture = p_render_buffers->get_texture_slice(RB_SCOPE_SSR, RB_SSR, v, 0);
+		RID mip_level_texture = p_render_buffers->get_texture_slice(RB_SCOPE_SSR, RB_MIP_LEVEL, v, 0);
+
+		ScreenSpaceReflectionRayQueryPushConstant push_constant;
+		memset(&push_constant, 0, sizeof(push_constant));
+		push_constant.screen_size[0] = p_ssr_buffers.size.width;
+		push_constant.screen_size[1] = p_ssr_buffers.size.height;
+		push_constant.mipmaps = p_ssr_buffers.mipmaps;
+		push_constant.max_distance = p_max_distance;
+		push_constant.depth_tolerance = p_tolerance;
+		push_constant.orthogonal = p_projections[v].is_orthogonal();
+		push_constant.view_index = v;
+		const bool use_probes = p_probes.buffer.is_valid() && p_probes.atlas.is_valid() && p_probes.count > 0;
+		push_constant.reflection_count = use_probes ? p_probes.count : 0;
+		push_constant.reflection_atlas_border_size[0] = p_probes.atlas_border_size.x;
+		push_constant.reflection_atlas_border_size[1] = p_probes.atlas_border_size.y;
+
+		RID shader = ssr.ray_query_shader.version_get_shader(ssr.ray_query_shader_version, 0);
+		RD::Uniform u_last_frame(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ linear_sampler, last_frame_texture });
+		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>{ nearest_sampler, depth_texture });
+		RD::Uniform u_normal_roughness(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>{ nearest_sampler, normal_roughness_texture });
+		RD::Uniform u_ssr(RD::UNIFORM_TYPE_IMAGE, 3, ssr_texture);
+		RD::Uniform u_mip_level(RD::UNIFORM_TYPE_IMAGE, 4, mip_level_texture);
+		RD::Uniform u_scene_data(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 5, ssr.ubo);
+		RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, p_tlas);
+		RD::Uniform u_probes(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, use_probes ? p_probes.buffer : ssr.ray_query_dummy_buffer);
+		RID atlas = use_probes ? p_probes.atlas : TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
+		RD::Uniform u_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>{ linear_sampler, atlas });
+
+		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, ssr.ray_query_pipeline.get_rid());
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_last_frame, u_depth, u_normal_roughness, u_ssr, u_mip_level, u_scene_data, u_tlas, u_probes, u_atlas), 0);
+		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+		RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_ssr_buffers.size.width, p_ssr_buffers.size.height, 1);
+		RD::get_singleton()->compute_list_end();
+	}
+
+	for (uint32_t v = 0; v < view_count && !ray_traced; v++) {
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
 		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, ssr.ssr_pipeline.get_rid());

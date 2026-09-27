@@ -3716,6 +3716,10 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/virtual_geometry/max_index_buffer_size", PROPERTY_HINT_RANGE, "1,1024,1,suffix:M indices"), 64);
 	GLOBAL_DEF("rendering/virtual_geometry/occlusion_culling", true);
 
+	GLOBAL_DEF_RST("rendering/ray_tracing/enabled", false);
+	GLOBAL_DEF("rendering/ray_tracing/reflections", true);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/max_distance", PROPERTY_HINT_RANGE, "1,10000,0.1,or_greater,suffix:m"), 100.0);
+
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality", PROPERTY_HINT_ENUM, "Hard (Fastest),Soft Very Low (Faster),Soft Low (Fast),Soft Medium (Average),Soft High (Slow),Soft Ultra (Slowest)"), 2);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality.mobile", 0);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/atlas_16_bits", true);

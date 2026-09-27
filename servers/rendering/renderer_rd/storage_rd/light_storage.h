@@ -1009,6 +1009,7 @@ public:
 	void free_reflection_data();
 	void set_max_reflection_probes(const uint32_t p_max_reflection_probes);
 	RID get_reflection_probe_buffer() { return reflection_buffer; }
+	uint32_t get_reflection_probe_count() const { return reflection_count; } // In the buffer, for the current render.
 	void update_reflection_probe_buffer(RenderDataRD *p_render_data, const PagedArray<RID> &p_reflections, const Transform3D &p_camera_inverse_transform, RID p_environment);
 	static RD::DataFormat get_reflection_probe_color_format();
 	static uint32_t get_reflection_probe_color_usage_bits(bool p_storage);
