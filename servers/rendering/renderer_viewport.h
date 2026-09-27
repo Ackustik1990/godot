@@ -55,6 +55,10 @@ public:
 		RID camera;
 		RID scenario;
 
+		// Temporal effects drop their history when the camera changes or when requested (camera cuts).
+		RID last_rendered_camera;
+		bool temporal_history_reset = false;
+
 		RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
 		Ref<RenderingUpscaler> custom_upscaler;
 		float scaling_3d_scale = 1.0;
@@ -235,6 +239,7 @@ public:
 
 	void viewport_set_scaling_3d_mode(RID p_viewport, RSE::ViewportScaling3DMode p_mode);
 	void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, const Ref<RenderingUpscaler> &p_upscaler);
+	void viewport_reset_temporal_history(RID p_viewport);
 	void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale);
 	void viewport_set_fsr_sharpness(RID p_viewport, float p_sharpness);
 	void viewport_set_texture_mipmap_bias(RID p_viewport, float p_mipmap_bias);

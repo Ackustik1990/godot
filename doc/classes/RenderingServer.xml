@@ -4230,6 +4230,13 @@
 				Detaches a viewport from a canvas.
 			</description>
 		</method>
+		<method name="viewport_reset_temporal_history">
+			<return type="void" />
+			<param index="0" name="viewport" type="RID" />
+			<description>
+				Makes temporal effects of the viewport (TAA, FSR 2, MetalFX temporal upscaling and custom [RenderingUpscaler]s) drop their accumulated history on the next frame. Call it on camera cuts, such as a teleport, so the previous view isn't blended into the new one. Changing the viewport's camera does this automatically. See also [method Viewport.reset_temporal_history].
+			</description>
+		</method>
 		<method name="viewport_set_active">
 			<return type="void" />
 			<param index="0" name="viewport" type="RID" />

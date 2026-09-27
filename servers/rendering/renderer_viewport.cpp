@@ -347,6 +347,16 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 		}
 	}
 
+	if (p_viewport->camera != p_viewport->last_rendered_camera || p_viewport->temporal_history_reset) {
+		// A different camera (or a requested camera cut) makes the history of temporal effects
+		// meaningless: reprojecting it would smear the previous view over the new one.
+		if (p_viewport->render_buffers.is_valid()) {
+			p_viewport->render_buffers->request_temporal_history_reset();
+		}
+		p_viewport->last_rendered_camera = p_viewport->camera;
+		p_viewport->temporal_history_reset = false;
+	}
+
 	float screen_mesh_lod_threshold = p_viewport->mesh_lod_threshold / float(p_viewport->size.width);
 	RSG::scene->render_camera(p_viewport->render_buffers, p_viewport->camera, p_viewport->scenario, p_viewport->self, p_viewport->internal_size, p_viewport->jitter_phase_count, screen_mesh_lod_threshold, p_viewport->shadow_atlas, p_viewport->window_output_max_value, &p_viewport->render_info);
 
@@ -1080,6 +1090,13 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
 	}
 
 	_configure_3d_render_buffers(viewport);
+}
+
+void RendererViewport::viewport_reset_temporal_history(RID p_viewport) {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL(viewport);
+
+	viewport->temporal_history_reset = true;
 }
 
 void RendererViewport::viewport_set_scaling_3d_custom_upscaler(RID p_viewport, const Ref<RenderingUpscaler> &p_upscaler) {

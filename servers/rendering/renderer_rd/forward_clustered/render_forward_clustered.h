@@ -868,7 +868,7 @@ private:
 	/* Custom (e.g. neural network) upscalers */
 	LocalVector<void *> native_upscale_calls;
 	uint64_t native_upscale_frame = 0;
-	void _process_custom_upscaler(RenderDataRD *p_render_data);
+	void _process_custom_upscaler(RenderDataRD *p_render_data, bool p_reset);
 	void _free_native_upscale_calls();
 
 	/* Debug */

@@ -102,7 +102,7 @@
 		<method name="get_reset" qualifiers="const">
 			<return type="bool" />
 			<description>
-				Returns [code]true[/code] when the history must be discarded, for example on the first frame after the render buffers were (re)created.
+				Returns [code]true[/code] when the history must be discarded: on the first frame after the render buffers were (re)created, after the viewport's camera changed, or after [method Viewport.reset_temporal_history] was called.
 			</description>
 		</method>
 		<method name="get_sharpness" qualifiers="const">

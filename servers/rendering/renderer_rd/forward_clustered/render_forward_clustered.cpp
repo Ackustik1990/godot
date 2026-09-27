@@ -2856,6 +2856,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, p_render_data);
 	}
 
+	// Consumed every frame, so a reset requested while no temporal effect runs doesn't linger.
+	const bool reset_temporal_history = rb->consume_temporal_history_reset();
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
 		if (scale_type == SCALE_FSR2) {
 			rb_data->ensure_fsr2(fsr2_effect);
@@ -2888,7 +2890,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.fovy = fovy;
 				params.jitter = jitter;
 				params.delta_time = float(time_step);
-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+				params.reset_accumulation = reset_temporal_history;
 
 				Projection correction;
 				correction.set_depth_correction(true, true, false);
@@ -2904,10 +2906,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 			RD::get_singleton()->draw_command_end_label();
 		} else if (scale_type == SCALE_CUSTOM) {
-			_process_custom_upscaler(p_render_data);
+			_process_custom_upscaler(p_render_data, reset_temporal_history);
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
-			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect) || reset_temporal_history;
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2937,7 +2939,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		} else if (using_taa) {
 			RD::get_singleton()->draw_command_begin_label("TAA");
 			RENDER_TIMESTAMP("TAA");
-			taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far);
+			taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far, reset_temporal_history);
 			RD::get_singleton()->draw_command_end_label();
 		}
 	}
@@ -2989,7 +2991,7 @@ void RenderForwardClustered::_free_native_upscale_calls() {
 	native_upscale_calls.clear();
 }
 
-void RenderForwardClustered::_process_custom_upscaler(RenderDataRD *p_render_data) {
+void RenderForwardClustered::_process_custom_upscaler(RenderDataRD *p_render_data, bool p_reset) {
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	const Ref<RenderingUpscaler> &upscaler = rb->get_custom_upscaler();
 	ERR_FAIL_COND(upscaler.is_null());
@@ -3007,7 +3009,6 @@ void RenderForwardClustered::_process_custom_upscaler(RenderDataRD *p_render_dat
 	}
 
 	const RenderSceneDataRD *scene_data = p_render_data->scene_data;
-	const bool reset = rb->consume_custom_upscaler_reset();
 
 	Projection correction;
 	correction.set_depth_correction(true, true, false);
@@ -3035,7 +3036,7 @@ void RenderForwardClustered::_process_custom_upscaler(RenderDataRD *p_render_dat
 		parameters->fov_y = Math::deg_to_rad(scene_data->cam_projection.get_fovy(fov, 1.0 / aspect));
 		parameters->delta_time = float(time_step);
 		parameters->sharpness = rb->get_fsr_sharpness();
-		parameters->reset = reset;
+		parameters->reset = p_reset;
 		parameters->view = v;
 		parameters->view_count = rb->get_view_count();
 		parameters->frame = frame;

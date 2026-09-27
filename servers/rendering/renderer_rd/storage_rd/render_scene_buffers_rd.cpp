@@ -164,7 +164,7 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
 
 	scaling_3d_mode = p_config->get_scaling_3d_mode();
 	custom_upscaler = p_config->get_custom_upscaler();
-	custom_upscaler_reset = true;
+	temporal_history_reset = true;
 	msaa_3d = p_config->get_msaa_3d();
 	screen_space_aa = p_config->get_screen_space_aa();
 

@@ -5120,6 +5120,11 @@ void Viewport::set_scaling_3d_custom_upscaler(const Ref<RenderingUpscaler> &p_up
 	RS::get_singleton()->viewport_set_scaling_3d_custom_upscaler(viewport, p_upscaler);
 }
 
+void Viewport::reset_temporal_history() {
+	ERR_MAIN_THREAD_GUARD;
+	RS::get_singleton()->viewport_reset_temporal_history(viewport);
+}
+
 Ref<RenderingUpscaler> Viewport::get_scaling_3d_custom_upscaler() const {
 	ERR_READ_THREAD_GUARD_V(Ref<RenderingUpscaler>());
 	return scaling_3d_custom_upscaler;
@@ -5389,6 +5394,7 @@ void Viewport::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_scaling_3d_mode"), &Viewport::get_scaling_3d_mode);
 
 	ClassDB::bind_method(D_METHOD("set_scaling_3d_custom_upscaler", "upscaler"), &Viewport::set_scaling_3d_custom_upscaler);
+	ClassDB::bind_method(D_METHOD("reset_temporal_history"), &Viewport::reset_temporal_history);
 	ClassDB::bind_method(D_METHOD("get_scaling_3d_custom_upscaler"), &Viewport::get_scaling_3d_custom_upscaler);
 
 	ClassDB::bind_method(D_METHOD("set_scaling_3d_scale", "scale"), &Viewport::set_scaling_3d_scale);

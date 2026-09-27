@@ -84,7 +84,7 @@ private:
 	Size2i internal_size = Size2i(0, 0);
 	RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_OFF;
 	Ref<RenderingUpscaler> custom_upscaler;
-	bool custom_upscaler_reset = true;
+	bool temporal_history_reset = true;
 	float fsr_sharpness = 0.2f;
 	float texture_mipmap_bias = 0.0f;
 	RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
@@ -209,6 +209,7 @@ public:
 	virtual void set_texture_mipmap_bias(float p_texture_mipmap_bias) override;
 	virtual void set_anisotropic_filtering_level(RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) override;
 	virtual void set_use_debanding(bool p_use_debanding) override;
+	virtual void request_temporal_history_reset() override { temporal_history_reset = true; }
 
 #ifdef METAL_ENABLED
 	void ensure_mfx(RendererRD::MFXSpatialEffect *p_effect);
@@ -245,10 +246,11 @@ public:
 	_FORCE_INLINE_ Size2i get_target_size() const { return target_size; }
 	_FORCE_INLINE_ RSE::ViewportScaling3DMode get_scaling_3d_mode() const { return scaling_3d_mode; }
 	_FORCE_INLINE_ const Ref<RenderingUpscaler> &get_custom_upscaler() const { return custom_upscaler; }
-	// Returns true once after the buffers are (re)configured, so upscalers can drop their history.
-	_FORCE_INLINE_ bool consume_custom_upscaler_reset() {
-		bool reset = custom_upscaler_reset;
-		custom_upscaler_reset = false;
+	// Returns true once after the buffers are (re)configured or a reset is requested, so
+	// temporal effects can drop their history.
+	_FORCE_INLINE_ bool consume_temporal_history_reset() {
+		bool reset = temporal_history_reset;
+		temporal_history_reset = false;
 		return reset;
 	}
 	_FORCE_INLINE_ float get_fsr_sharpness() const { return fsr_sharpness; }

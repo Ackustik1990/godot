@@ -274,6 +274,12 @@
 				[b]Note:[/b] This method doesn't propagate input events to embedded [Window]s or [SubViewport]s.
 			</description>
 		</method>
+		<method name="reset_temporal_history">
+			<return type="void" />
+			<description>
+				Makes temporal effects (TAA, FSR 2, MetalFX temporal upscaling and custom [RenderingUpscaler]s) drop their accumulated history on the next frame. Call it on camera cuts, such as when teleporting the camera, so the previous view isn't blended into the new one. Making another [Camera3D] current does this automatically.
+			</description>
+		</method>
 		<method name="set_canvas_cull_mask_bit">
 			<return type="void" />
 			<param index="0" name="layer" type="int" />

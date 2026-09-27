@@ -119,4 +119,8 @@ public:
 	virtual void set_texture_mipmap_bias(float p_texture_mipmap_bias) = 0;
 	virtual void set_anisotropic_filtering_level(RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) = 0;
 	virtual void set_use_debanding(bool p_use_debanding) = 0;
+
+	// Temporal effects (TAA, temporal upscalers) drop their history on the next frame,
+	// for example after a camera cut.
+	virtual void request_temporal_history_reset() {}
 };

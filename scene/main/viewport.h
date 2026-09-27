@@ -612,6 +612,8 @@ public:
 	void set_scaling_3d_custom_upscaler(const Ref<RenderingUpscaler> &p_upscaler);
 	Ref<RenderingUpscaler> get_scaling_3d_custom_upscaler() const;
 
+	void reset_temporal_history();
+
 	void set_scaling_3d_scale(float p_scaling_3d_scale);
 	float get_scaling_3d_scale() const;
 
