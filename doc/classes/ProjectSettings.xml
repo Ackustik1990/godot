@@ -3602,6 +3602,9 @@
 		<member name="rendering/virtual_geometry/max_index_buffer_size" type="int" setter="" getter="" default="64">
 			The maximum size, in millions of indices (4 bytes each), of the index buffer that holds the triangles selected by virtual geometry for a batch of views (the camera, or all shadow maps rendered together). The buffers grow automatically up to this size; if the selected triangles don't fit, some instances are skipped for that frame.
 		</member>
+		<member name="rendering/virtual_geometry/occlusion_culling" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], clusters of virtual geometry hidden behind other geometry are culled on the GPU with a two-pass test against a hierarchical depth buffer: clusters hidden in the previous frame are skipped in the depth pre-pass, then tested again against the depth of the current frame, and the ones that became visible are drawn in a second pre-pass. This never hides visible geometry, even when the camera or objects move. It only applies to the main camera of viewports that use a depth pre-pass, without MSAA and without XR. Can be changed at runtime.
+		</member>
 		<member name="rendering/vrs/mode" type="int" setter="" getter="" default="0">
 			Set the default Variable Rate Shading (VRS) mode for the main viewport. See [member Viewport.vrs_mode] to change this at runtime, and [enum Viewport.VRSMode] for possible values.
 		</member>

@@ -131,6 +131,13 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		cluster_builder = nullptr;
 	}
 
+	if (vg_hzb_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(vg_hzb_buffer);
+		vg_hzb_buffer = RID();
+	}
+	vg_hzb_buffer_size = 0;
+	vg_hzb_valid = false;
+
 	if (fsr2_context) {
 		memdelete(fsr2_context);
 		fsr2_context = nullptr;
@@ -400,6 +407,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				mesh_surface = surf->surface;
 			}
 		}
+		if (p_params->vg_disoccluded_only && vg_draw == RendererRD::VirtualGeometry::INVALID_DRAW) {
+			continue; // Already drawn by the first pass.
+		}
 
 		if (!mesh_surface) {
 			continue;
@@ -558,7 +568,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 		if (pipeline_valid) {
 			if (vg_draw != RendererRD::VirtualGeometry::INVALID_DRAW) {
-				index_array_rd = p_params->vg_index_array;
+				index_array_rd = p_params->vg_index_array; // Shared by the main and disoccluded draws.
 			} else if (!emulate_point_size) {
 				index_array_rd = mesh_storage->mesh_surface_get_index_array(mesh_surface, element_info.lod_index);
 			} else {
@@ -624,8 +634,14 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
 
 			if (vg_draw != RendererRD::VirtualGeometry::INVALID_DRAW) {
-				// Triangles selected and compacted on the GPU by the virtual geometry cull pass.
-				RD::get_singleton()->draw_list_draw_indirect(draw_list, true, p_params->vg_command_buffer, vg_draw * RendererRD::VirtualGeometry::COMMAND_STRIDE_BYTES, 1, 0);
+				// Triangles selected and compacted on the GPU by the virtual geometry cull passes.
+				const uint32_t command_offset = vg_draw * RendererRD::VirtualGeometry::COMMAND_STRIDE_BYTES;
+				if (!p_params->vg_disoccluded_only) {
+					RD::get_singleton()->draw_list_draw_indirect(draw_list, true, p_params->vg_command_buffer, command_offset, 1, 0);
+				}
+				if (p_params->vg_disoccluded_command_buffer.is_valid()) {
+					RD::get_singleton()->draw_list_draw_indirect(draw_list, true, p_params->vg_disoccluded_command_buffer, command_offset, 1, 0);
+				}
 			} else if (emulate_point_size) {
 				if (indirect) {
 					WARN_PRINT("Indirect draws are not supported when emulating point size.");
@@ -1853,9 +1869,11 @@ uint32_t RenderForwardClustered::_virtual_geometry_get_job_flags(const GeometryI
 	return flags;
 }
 
-void RenderForwardClustered::_virtual_geometry_setup_main(const RenderDataRD *p_render_data) {
+void RenderForwardClustered::_virtual_geometry_setup_main(const RenderDataRD *p_render_data, bool p_occlusion_culling) {
 	virtual_geometry_main_commands = RID();
 	virtual_geometry_main_indices = RID();
+	virtual_geometry_disoccluded_commands = RID();
+	virtual_geometry_occlusion_pending = false;
 	if (!virtual_geometry_active) {
 		return;
 	}
@@ -1871,6 +1889,35 @@ void RenderForwardClustered::_virtual_geometry_setup_main(const RenderDataRD *p_
 	view.lod_orthogonal = scene_data->cam_orthogonal;
 	view.lod_distance_multiplier = scene_data->lod_distance_multiplier;
 	view.lod_threshold = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLE_LOD ? 0.0f : scene_data->screen_mesh_lod_threshold;
+
+	RID hzb_buffer;
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	Ref<RenderBufferDataForwardClustered> rb_data;
+	if (p_occlusion_culling && virtual_geometry->is_occlusion_culling_enabled() && rb.is_valid() && rb->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
+		rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+		const Size2i depth_size = rb->get_internal_size();
+		const uint32_t mip_count = RendererRD::VirtualGeometry::get_hzb_mip_count(depth_size);
+		const uint32_t hzb_size = RendererRD::VirtualGeometry::get_hzb_buffer_size(depth_size);
+		if (rb_data->vg_hzb_buffer.is_null() || rb_data->vg_hzb_buffer_size != hzb_size) {
+			if (rb_data->vg_hzb_buffer.is_valid()) {
+				RD::get_singleton()->free_rid(rb_data->vg_hzb_buffer);
+			}
+			rb_data->vg_hzb_buffer = RD::get_singleton()->storage_buffer_create(hzb_size);
+			RD::get_singleton()->set_resource_name(rb_data->vg_hzb_buffer, "VirtualGeometryHZB");
+			rb_data->vg_hzb_buffer_size = hzb_size;
+			rb_data->vg_hzb_valid = false;
+		}
+
+		Projection correction;
+		correction.set_depth_correction(scene_data->flip_y);
+		view.occlusion_culling = true;
+		view.occlusion_current = correction * scene_data->cam_projection * Projection(scene_data->cam_transform.affine_inverse());
+		view.occlusion_previous = rb_data->vg_hzb_matrix;
+		view.occlusion_previous_valid = rb_data->vg_hzb_valid;
+		view.depth_size = depth_size;
+		view.hzb_mip_count = mip_count;
+		hzb_buffer = rb_data->vg_hzb_buffer;
+	}
 
 	virtual_geometry->begin_batch();
 	virtual_geometry_batch_id++;
@@ -1910,11 +1957,35 @@ void RenderForwardClustered::_virtual_geometry_setup_main(const RenderDataRD *p_
 		}
 	}
 
-	virtual_geometry->end_batch();
+	virtual_geometry->end_batch(hzb_buffer);
 	if (!render_list[RENDER_LIST_OPAQUE].vg_draws.is_empty() || !render_list[RENDER_LIST_MOTION].vg_draws.is_empty()) {
 		virtual_geometry_main_commands = virtual_geometry->get_command_buffer();
 		virtual_geometry_main_indices = virtual_geometry->get_index_array();
+		virtual_geometry_occlusion_pending = virtual_geometry->has_disoccluded_pass();
 	}
+}
+
+void RenderForwardClustered::_virtual_geometry_process_occlusion(const RenderDataRD *p_render_data) {
+	if (!virtual_geometry_occlusion_pending) {
+		return;
+	}
+	virtual_geometry_occlusion_pending = false;
+
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	Ref<RenderBufferDataForwardClustered> rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	ERR_FAIL_COND(rb_data->vg_hzb_buffer.is_null());
+
+	// Build the HZB from the depth of this frame's pre-pass, then retest the clusters the
+	// first pass rejected with the depth of the previous frame.
+	virtual_geometry->build_hzb(rb->get_depth_texture(), rb->get_internal_size(), rb_data->vg_hzb_buffer);
+	virtual_geometry->process_disoccluded(rb_data->vg_hzb_buffer);
+
+	Projection correction;
+	correction.set_depth_correction(p_render_data->scene_data->flip_y);
+	rb_data->vg_hzb_matrix = correction * p_render_data->scene_data->cam_projection * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
+	rb_data->vg_hzb_valid = true;
+
+	virtual_geometry_disoccluded_commands = virtual_geometry->get_command_buffer(RendererRD::VirtualGeometry::PASS_DISOCCLUDED);
 }
 
 void RenderForwardClustered::_virtual_geometry_setup_shadows() {
@@ -1975,7 +2046,7 @@ void RenderForwardClustered::_virtual_geometry_setup_shadows() {
 	}
 }
 
-void RenderForwardClustered::_virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array) {
+void RenderForwardClustered::_virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array, RID p_disoccluded_command_buffer) {
 	const RenderList &rl = render_list[p_list];
 	if (p_command_buffer.is_null() || p_index_array.is_null() || rl.vg_draws.is_empty()) {
 		return;
@@ -1983,6 +2054,7 @@ void RenderForwardClustered::_virtual_geometry_apply(RenderListParameters &p_par
 	p_params.vg_draws = rl.vg_draws.ptr() + p_offset;
 	p_params.vg_command_buffer = p_command_buffer;
 	p_params.vg_index_array = p_index_array;
+	p_params.vg_disoccluded_command_buffer = p_disoccluded_command_buffer;
 }
 
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
@@ -2222,8 +2294,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	RD::get_singleton()->draw_command_end_label();
 
 	// Select and compact the clusters of virtual geometry surfaces for this camera. The result
-	// is shared by the depth pre-pass, the opaque pass and the motion pass.
-	_virtual_geometry_setup_main(p_render_data);
+	// is shared by the depth pre-pass, the opaque pass and the motion pass. Occlusion culling
+	// needs the depth pre-pass to build the HZB of the current frame (see below).
+	{
+		const bool will_use_depth_prepass = !is_reflection_probe && rb_data.is_valid() && (scene_state.used_opaque_stencil || scene_shader.depth_prepass_enabled);
+		const bool occlusion_culling = will_use_depth_prepass && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED && rb->get_view_count() == 1;
+		_virtual_geometry_setup_main(p_render_data, occlusion_culling);
+	}
 
 	if (!is_reflection_probe) {
 		if (using_voxelgi) {
@@ -2445,6 +2522,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_virtual_geometry_apply(render_list_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices);
 		_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DrawFlags(needs_pre_resolve ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL), depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
 
+		if (virtual_geometry_occlusion_pending) {
+			// Virtual geometry occlusion culling: retest the clusters hidden in the previous frame
+			// against this depth, and add the ones that became visible to the depth buffer.
+			_virtual_geometry_process_occlusion(p_render_data);
+
+			RenderListParameters disoccluded_params = render_list_params;
+			disoccluded_params.vg_disoccluded_only = true;
+			_virtual_geometry_apply(disoccluded_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices, virtual_geometry_disoccluded_commands);
+			_render_list_with_draw_list(&disoccluded_params, depth_framebuffer, RD::DRAW_DEFAULT_ALL, depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
+		}
+
 		RD::get_singleton()->draw_command_end_label();
 
 		if (use_msaa) {
@@ -2525,7 +2613,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			uint32_t opaque_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
 			RID opaque_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(opaque_color_pass_flags) : color_framebuffer;
 			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
-			_virtual_geometry_apply(render_list_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices);
+			if (unlikely(virtual_geometry_occlusion_pending)) {
+				ERR_PRINT_ONCE("Virtual geometry occlusion culling was set up without a depth pre-pass. This is a bug.");
+				virtual_geometry_occlusion_pending = false;
+			}
+			_virtual_geometry_apply(render_list_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices, virtual_geometry_disoccluded_commands);
 			_render_list_with_draw_list(&render_list_params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
 		}
 
@@ -2552,7 +2644,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_MOTION, p_render_data, is_multiview, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
 
 			RenderListParameters render_list_params(render_list[RENDER_LIST_MOTION].elements.ptr(), render_list[RENDER_LIST_MOTION].element_info.ptr(), render_list[RENDER_LIST_MOTION].elements.size(), reverse_cull, PASS_MODE_COLOR, color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
-			_virtual_geometry_apply(render_list_params, RENDER_LIST_MOTION, 0, virtual_geometry_main_commands, virtual_geometry_main_indices);
+			_virtual_geometry_apply(render_list_params, RENDER_LIST_MOTION, 0, virtual_geometry_main_commands, virtual_geometry_main_indices, virtual_geometry_disoccluded_commands);
 			_render_list_with_draw_list(&render_list_params, color_framebuffer);
 
 			RD::get_singleton()->draw_command_end_label();
@@ -4723,7 +4815,12 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 		sdcache->compressed_uv_scale = mesh_storage->mesh_surface_get_uv_scale(sdcache->surface);
 	}
 
-	if (virtual_geometry && ginstance->data->base_type == RSE::INSTANCE_MESH && sdcache->primitive == RSE::PRIMITIVE_TRIANGLES && !(flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) && mesh_storage->mesh_surface_has_virtual_geometry(sdcache->surface)) {
+	// Virtual geometry is only used when the drawn triangles can be selected and culled with
+	// the static cluster bounds: opaque materials that don't move vertices. Transparent
+	// materials are excluded because their depth pre-pass must match the alpha pass exactly.
+	const SceneShaderForwardClustered::ShaderData *vg_shader = p_material->shader_data;
+	const bool vg_compatible_material = !(flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA | GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS)) && !vg_shader->uses_vertex && !vg_shader->uses_position && !vg_shader->writes_modelview_or_projection && !vg_shader->uses_point_size;
+	if (virtual_geometry && vg_compatible_material && ginstance->data->base_type == RSE::INSTANCE_MESH && sdcache->primitive == RSE::PRIMITIVE_TRIANGLES && mesh_storage->mesh_surface_has_virtual_geometry(sdcache->surface)) {
 		sdcache->flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_VIRTUAL_GEOMETRY;
 	}
 

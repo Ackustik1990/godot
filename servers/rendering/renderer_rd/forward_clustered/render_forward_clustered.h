@@ -136,6 +136,12 @@ public:
 
 		RID render_sdfgi_uniform_set;
 
+		// Virtual geometry occlusion culling: HZB of the last frame and its world to clip matrix.
+		RID vg_hzb_buffer;
+		uint32_t vg_hzb_buffer_size = 0;
+		Projection vg_hzb_matrix;
+		bool vg_hzb_valid = false;
+
 		void ensure_specular();
 		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR); }
 		RID get_specular() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR); }
@@ -252,10 +258,14 @@ private:
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
 		bool use_material_feedback = false;
 
-		// Virtual geometry: per element draw index into vg_command_buffer (VirtualGeometry::INVALID_DRAW for regular draws).
+		// Virtual geometry: per element draw index into the command buffers (VirtualGeometry::INVALID_DRAW for regular draws).
 		const uint32_t *vg_draws = nullptr;
 		RID vg_command_buffer;
 		RID vg_index_array;
+		// Clusters that became visible after the depth pre-pass (occlusion culling), drawn with a second
+		// indirect draw from the same index array.
+		RID vg_disoccluded_command_buffer;
+		bool vg_disoccluded_only = false; // Only draw the disoccluded clusters, skip everything else.
 
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}, bool p_use_material_feedback = false) {
 			elements = p_elements;
@@ -813,14 +823,17 @@ private:
 	uint64_t virtual_geometry_batch_id = 0;
 	RID virtual_geometry_main_commands;
 	RID virtual_geometry_main_indices;
+	RID virtual_geometry_disoccluded_commands;
+	bool virtual_geometry_occlusion_pending = false; // The main batch waits for the HZB of this frame.
 	RID virtual_geometry_shadow_commands;
 	RID virtual_geometry_shadow_indices;
 
 	_FORCE_INLINE_ bool _virtual_geometry_is_eligible(const GeometryInstanceSurfaceDataCache *p_surface) const;
 	uint32_t _virtual_geometry_get_job_flags(const GeometryInstanceSurfaceDataCache *p_surface, bool p_shadow, bool p_reverse_cull_face) const;
-	void _virtual_geometry_setup_main(const RenderDataRD *p_render_data);
+	void _virtual_geometry_setup_main(const RenderDataRD *p_render_data, bool p_occlusion_culling);
+	void _virtual_geometry_process_occlusion(const RenderDataRD *p_render_data);
 	void _virtual_geometry_setup_shadows();
-	void _virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array);
+	void _virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array, RID p_disoccluded_command_buffer = RID());
 
 	/* Cluster builder */
 
