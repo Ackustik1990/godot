@@ -88,6 +88,23 @@
 				Removes all surfaces from this [ArrayMesh].
 			</description>
 		</method>
+		<method name="clear_virtual_geometry">
+			<return type="void" />
+			<description>
+				Removes the virtual geometry data from all surfaces. See [method generate_virtual_geometry].
+			</description>
+		</method>
+		<method name="generate_virtual_geometry">
+			<return type="int" enum="Error" />
+			<param index="0" name="surf_idx" type="int" default="-1" />
+			<description>
+				Builds the virtual geometry of the surface at [param surf_idx], or of every triangle surface if [param surf_idx] is [code]-1[/code]. Returns [constant OK] on success.
+				Virtual geometry splits a surface into clusters of up to 128 triangles and builds a hierarchy of simplified cluster groups on top of them. At render time, the Forward+ renderer selects on the GPU, for each instance, view and shadow map, the clusters whose simplification error is smaller than [member Viewport.mesh_lod_threshold] pixels, culls them against the view frustum and their normal cone, and draws them with a single indirect draw call. Different parts of the same mesh use different levels of detail without cracks, so this is particularly effective for large, dense meshes (terrain, rocks, architecture) and many instances of high-poly models.
+				Since the simplifier never creates vertices, every level of detail uses the vertex buffer of the surface, so all materials, shaders and render passes work as usual. The data is saved with the mesh and adds roughly 13 bytes per triangle. It can also be generated on import with the [code]meshes/generate_virtual_geometry[/code] option of the scene importer.
+				[b]Note:[/b] Virtual geometry is only used by the Forward+ renderer, and only for [MeshInstance3D] nodes that aren't skinned and don't use blend shapes. Other cases render the surface normally. It can be disabled globally with [member ProjectSettings.rendering/virtual_geometry/enabled].
+				[b]Note:[/b] Requires the meshoptimizer module, which is enabled by default.
+			</description>
+		</method>
 		<method name="get_blend_shape_count" qualifiers="const">
 			<return type="int" />
 			<description>
@@ -163,6 +180,13 @@
 			<param index="0" name="surf_idx" type="int" />
 			<description>
 				Returns the primitive type of the requested surface (see [method add_surface_from_arrays]).
+			</description>
+		</method>
+		<method name="surface_has_virtual_geometry" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="surf_idx" type="int" />
+			<description>
+				Returns [code]true[/code] if the surface at [param surf_idx] has virtual geometry data. See [method generate_virtual_geometry].
 			</description>
 		</method>
 		<method name="surface_remove">

@@ -235,6 +235,8 @@ void register_server_types() {
 	GDREGISTER_CLASS(RenderSceneDataExtension);
 
 	GDREGISTER_CLASS(RenderSceneBuffersConfiguration);
+	GDREGISTER_CLASS(RenderingUpscaler);
+	GDREGISTER_CLASS(RenderingUpscaleParameters);
 	GDREGISTER_ABSTRACT_CLASS(RenderSceneBuffers);
 	GDREGISTER_CLASS(RenderSceneBuffersExtension);
 

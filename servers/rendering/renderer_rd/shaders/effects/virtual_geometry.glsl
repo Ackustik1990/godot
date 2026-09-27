@@ -1,0 +1,371 @@
+#[compute]
+
+#version 450
+
+#VERSION_DEFINES
+
+// GPU-driven cluster LOD selection and culling for virtual geometry.
+//
+// MODE_CULL:   one thread per cluster of every job (instance/view pair). Selects the
+//              clusters of the LOD cut, culls them against the view frustum and their
+//              normal cone, appends the survivors to a visible list and accumulates the
+//              number of indices needed per job.
+// MODE_PREFIX: a single workgroup computes where the indices of each job go in the
+//              shared output index buffer (exclusive prefix sum) and prepares the
+//              indirect dispatch of MODE_EMIT.
+// MODE_EMIT:   one workgroup per visible cluster, one thread per triangle. Decodes the
+//              cluster's micro index buffer and writes absolute vertex indices into the
+//              output index buffer, which is then drawn with one indirect draw per job.
+
+#if defined(MODE_EMIT)
+#define WORKGROUP_SIZE 128
+#elif defined(MODE_PREFIX)
+#define WORKGROUP_SIZE 256
+#else
+#define WORKGROUP_SIZE 64
+#endif
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+#define ROOT_ERROR 1.0e38
+#define COMMAND_STRIDE 8u
+#define DISPATCH_WIDTH 32768u
+
+// Must match VirtualGeometryFormat::Cluster.
+struct Cluster {
+	vec4 bounds;
+	vec4 lod_sphere;
+	vec4 parent_sphere;
+	float lod_error;
+	float parent_error;
+	uint cone;
+	uint counts;
+	uint vertex_offset;
+	uint triangle_offset;
+	uint pad0;
+	uint pad1;
+};
+
+// Must match VirtualGeometry::JobGPU.
+struct Job {
+	vec4 transform_x; // Rows of the 3x4 mesh-to-view-origin transform.
+	vec4 transform_y;
+	vec4 transform_z;
+	uint cluster_offset;
+	uint cluster_count;
+	uint data_offset;
+	uint workgroup_offset;
+	uint view_index;
+	uint flags;
+	float scale;
+	uint pad;
+};
+
+#define JOB_FLAG_CONE_CULL 1u
+#define JOB_FLAG_CONE_INVERT 2u
+
+// Must match VirtualGeometry::ViewGPU. Positions are relative to the view origin.
+struct View {
+	vec4 planes[6]; // Outward facing: a sphere is outside when dot(n, c) - d > r.
+	vec4 lod_position; // xyz: LOD camera position, w: LOD factor (1 / (distance multiplier * threshold)).
+	vec4 cull_position; // xyz: camera position (perspective) or view direction (orthogonal).
+	uint flags;
+	uint plane_mask;
+	uint pad0;
+	uint pad1;
+};
+
+#define VIEW_FLAG_LOD_ORTHOGONAL 1u
+#define VIEW_FLAG_CULL_ORTHOGONAL 2u
+#define VIEW_FLAG_FRUSTUM 4u
+#define VIEW_FLAG_CONE 8u
+#define VIEW_FLAG_FORCE_LOD0 16u
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer Clusters {
+	Cluster data[];
+}
+clusters;
+
+layout(set = 0, binding = 1, std430) restrict readonly buffer ClusterData {
+	uint data[];
+}
+cluster_data;
+
+layout(set = 0, binding = 2, std430) restrict readonly buffer Jobs {
+	Job data[];
+}
+jobs;
+
+layout(set = 0, binding = 3, std430) restrict readonly buffer Views {
+	View data[];
+}
+views;
+
+// Per job: index_count, instance_count, first_index, vertex_offset, first_instance (VkDrawIndexedIndirectCommand), write cursor, pad, pad.
+layout(set = 0, binding = 4, std430) restrict buffer DrawCommands {
+	uint data[];
+}
+draw_commands;
+
+layout(set = 0, binding = 5, std430) restrict buffer VisibleClusters {
+	uvec2 data[]; // x: job, y: cluster (relative to the job).
+}
+visible_clusters;
+
+layout(set = 0, binding = 6, std430) restrict buffer BatchState {
+	uint visible_count;
+	uint index_count; // Indices required by the batch, even if they didn't fit.
+	uint dispatch_x;
+	uint dispatch_y;
+	uint dispatch_z;
+	uint overflow;
+	uint pad0;
+	uint pad1;
+}
+batch;
+
+layout(set = 0, binding = 7, std430) restrict writeonly buffer OutputIndices {
+	uint data[];
+}
+output_indices;
+
+layout(push_constant, std430) uniform Params {
+	uint job_count;
+	uint workgroup_count;
+	uint index_capacity;
+	uint visible_capacity;
+}
+params;
+
+#ifdef MODE_CULL
+
+shared uint s_visible_count;
+shared uint s_index_count;
+shared uint s_visible_base;
+
+vec3 transform_point(Job p_job, vec3 p_point) {
+	vec4 point = vec4(p_point, 1.0);
+	return vec3(dot(p_job.transform_x, point), dot(p_job.transform_y, point), dot(p_job.transform_z, point));
+}
+
+vec3 transform_vector(Job p_job, vec3 p_vector) {
+	return vec3(dot(p_job.transform_x.xyz, p_vector), dot(p_job.transform_y.xyz, p_vector), dot(p_job.transform_z.xyz, p_vector));
+}
+
+// True when the simplification error of a group projects below the pixel threshold.
+// Group spheres enclose their children and errors are monotonic along the DAG, so for
+// any camera a parent is never "fine enough" while one of its children isn't.
+bool is_fine_enough(View p_view, Job p_job, vec4 p_sphere, float p_error) {
+	if (p_error <= 0.0) {
+		return true; // Full detail.
+	}
+	if (p_error >= ROOT_ERROR || (p_view.flags & VIEW_FLAG_FORCE_LOD0) != 0u) {
+		return false;
+	}
+	float error = p_error * p_job.scale * p_view.lod_position.w;
+	if ((p_view.flags & VIEW_FLAG_LOD_ORTHOGONAL) != 0u) {
+		return error <= 1.0;
+	}
+	vec3 center = transform_point(p_job, p_sphere.xyz);
+	float distance = length(center - p_view.lod_position.xyz) - p_sphere.w * p_job.scale;
+	// When the camera is inside the sphere, distance is negative and only full detail passes.
+	return error <= distance;
+}
+
+void main() {
+	uint workgroup = gl_WorkGroupID.y * DISPATCH_WIDTH + gl_WorkGroupID.x;
+	if (workgroup >= params.workgroup_count) {
+		return; // Uniform for the whole workgroup.
+	}
+
+	// Find the job owning this workgroup; jobs are sorted by workgroup offset.
+	uint lo = 0u;
+	uint hi = params.job_count - 1u;
+	while (lo < hi) {
+		uint mid = (lo + hi + 1u) >> 1u;
+		if (jobs.data[mid].workgroup_offset <= workgroup) {
+			lo = mid;
+		} else {
+			hi = mid - 1u;
+		}
+	}
+	uint job_index = lo;
+	Job job = jobs.data[job_index];
+
+	if (gl_LocalInvocationIndex == 0u) {
+		s_visible_count = 0u;
+		s_index_count = 0u;
+	}
+	barrier();
+
+	uint local_cluster = (workgroup - job.workgroup_offset) * WORKGROUP_SIZE + gl_LocalInvocationIndex;
+	bool visible = false;
+	uint index_count = 0u;
+
+	if (local_cluster < job.cluster_count) {
+		Cluster cluster = clusters.data[job.cluster_offset + local_cluster];
+		View view = views.data[job.view_index];
+
+		// LOD cut: this cluster is detailed enough, but the group it simplifies into isn't.
+		visible = is_fine_enough(view, job, cluster.lod_sphere, cluster.lod_error) && !is_fine_enough(view, job, cluster.parent_sphere, cluster.parent_error);
+
+		if (visible) {
+			vec3 center = transform_point(job, cluster.bounds.xyz);
+			float radius = cluster.bounds.w * job.scale;
+
+			if ((view.flags & VIEW_FLAG_FRUSTUM) != 0u) {
+				for (uint i = 0u; i < 6u; i++) {
+					if ((view.plane_mask & (1u << i)) != 0u && dot(view.planes[i].xyz, center) - view.planes[i].w > radius) {
+						visible = false;
+						break;
+					}
+				}
+			}
+
+			if (visible && (view.flags & VIEW_FLAG_CONE) != 0u && (job.flags & JOB_FLAG_CONE_CULL) != 0u) {
+				vec4 cone = unpackSnorm4x8(cluster.cone);
+				if (cone.w < 1.0) {
+					// The quantized cutoff is conservative for the quantized (not renormalized) axis,
+					// so only undo the uniform scale of the instance.
+					vec3 axis = transform_vector(job, cone.xyz) / job.scale;
+					if ((job.flags & JOB_FLAG_CONE_INVERT) != 0u) {
+						axis = -axis;
+					}
+					if ((view.flags & VIEW_FLAG_CULL_ORTHOGONAL) != 0u) {
+						// cull_position holds the view direction.
+						visible = dot(view.cull_position.xyz, axis) < cone.w;
+					} else {
+						vec3 to_cluster = center - view.cull_position.xyz;
+						visible = dot(to_cluster, axis) < cone.w * length(to_cluster) + radius;
+					}
+				}
+			}
+		}
+
+		if (visible) {
+			index_count = ((cluster.counts & 0xFFu) + 1u) * 3u;
+		}
+	}
+
+	// Aggregate in shared memory so each workgroup does only one global atomic per counter.
+	uint slot = 0u;
+	if (visible) {
+		slot = atomicAdd(s_visible_count, 1u);
+		atomicAdd(s_index_count, index_count);
+	}
+	barrier();
+
+	if (gl_LocalInvocationIndex == 0u) {
+		s_visible_base = 0u;
+		if (s_visible_count > 0u) {
+			s_visible_base = atomicAdd(batch.visible_count, s_visible_count);
+			atomicAdd(draw_commands.data[job_index * COMMAND_STRIDE], s_index_count);
+		}
+	}
+	barrier();
+
+	if (visible) {
+		uint index = s_visible_base + slot;
+		if (index < params.visible_capacity) {
+			visible_clusters.data[index] = uvec2(job_index, local_cluster);
+		}
+	}
+}
+
+#endif // MODE_CULL
+
+#ifdef MODE_PREFIX
+
+shared uint s_scan[WORKGROUP_SIZE];
+shared uint s_running;
+
+void main() {
+	uint lid = gl_LocalInvocationIndex;
+	if (lid == 0u) {
+		s_running = 0u;
+	}
+	barrier();
+
+	// Exclusive prefix sum of the index counts, in chunks of WORKGROUP_SIZE jobs.
+	for (uint first = 0u; first < params.job_count; first += WORKGROUP_SIZE) {
+		uint job_index = first + lid;
+		uint count = job_index < params.job_count ? draw_commands.data[job_index * COMMAND_STRIDE] : 0u;
+		s_scan[lid] = count;
+		barrier();
+
+		for (uint offset = 1u; offset < WORKGROUP_SIZE; offset <<= 1u) {
+			uint value = lid >= offset ? s_scan[lid - offset] : 0u;
+			barrier();
+			s_scan[lid] += value;
+			barrier();
+		}
+
+		if (job_index < params.job_count) {
+			draw_commands.data[job_index * COMMAND_STRIDE + 2u] = s_running + s_scan[lid] - count;
+		}
+		barrier();
+
+		if (lid == WORKGROUP_SIZE - 1u) {
+			s_running += s_scan[lid];
+		}
+		barrier();
+	}
+
+	if (lid == 0u) {
+		batch.index_count = s_running;
+		uint visible = min(batch.visible_count, params.visible_capacity);
+		batch.dispatch_x = min(visible, DISPATCH_WIDTH);
+		batch.dispatch_y = (visible + DISPATCH_WIDTH - 1u) / DISPATCH_WIDTH;
+		batch.dispatch_z = 1u;
+	}
+
+	for (uint job_index = lid; job_index < params.job_count; job_index += WORKGROUP_SIZE) {
+		uint command = job_index * COMMAND_STRIDE;
+		if (draw_commands.data[command + 2u] + draw_commands.data[command] > params.index_capacity) {
+			// Out of space: skip this draw. The CPU grows the output buffer for the next frames.
+			draw_commands.data[command] = 0u;
+			batch.overflow = 1u;
+		}
+	}
+}
+
+#endif // MODE_PREFIX
+
+#ifdef MODE_EMIT
+
+shared uint s_output_offset;
+
+void main() {
+	uint entry_index = gl_WorkGroupID.y * DISPATCH_WIDTH + gl_WorkGroupID.x;
+	if (entry_index >= min(batch.visible_count, params.visible_capacity)) {
+		return;
+	}
+
+	uvec2 entry = visible_clusters.data[entry_index];
+	uint command = entry.x * COMMAND_STRIDE;
+	if (draw_commands.data[command] == 0u) {
+		return; // The job didn't fit in the output buffer.
+	}
+
+	uint data_offset = jobs.data[entry.x].data_offset;
+	uint cluster_index = jobs.data[entry.x].cluster_offset + entry.y;
+	uint triangle_count = (clusters.data[cluster_index].counts & 0xFFu) + 1u;
+	uint vertex_base = data_offset + clusters.data[cluster_index].vertex_offset;
+	uint triangle_base = data_offset + clusters.data[cluster_index].triangle_offset;
+
+	if (gl_LocalInvocationIndex == 0u) {
+		s_output_offset = draw_commands.data[command + 2u] + atomicAdd(draw_commands.data[command + 5u], triangle_count * 3u);
+	}
+	barrier();
+
+	uint triangle = gl_LocalInvocationIndex;
+	if (triangle < triangle_count) {
+		uint packed_triangle = cluster_data.data[triangle_base + triangle];
+		uint output_offset = s_output_offset + triangle * 3u;
+		output_indices.data[output_offset + 0u] = cluster_data.data[vertex_base + (packed_triangle & 0xFFu)];
+		output_indices.data[output_offset + 1u] = cluster_data.data[vertex_base + ((packed_triangle >> 8u) & 0xFFu)];
+		output_indices.data[output_offset + 2u] = cluster_data.data[vertex_base + ((packed_triangle >> 16u) & 0xFFu)];
+	}
+}
+
+#endif // MODE_EMIT

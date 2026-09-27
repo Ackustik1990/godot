@@ -159,10 +159,20 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 				WARN_PRINT_ONCE("MetalFX and FSR upscaling are not supported in the Compatibility renderer. Falling back to bilinear scaling.");
 			}
 
-			if ((scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) && OS::get_singleton()->get_current_rendering_method() == "mobile") {
+			if ((scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM) && OS::get_singleton()->get_current_rendering_method() == "mobile") {
 				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
 				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
 				WARN_PRINT_ONCE("MetalFX temporal and FSR upscaling are not supported in the Mobile renderer. Falling back to bilinear scaling.");
+			}
+
+			if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM && (p_viewport->custom_upscaler.is_null() || !p_viewport->custom_upscaler->is_supported())) {
+				if (p_viewport->custom_upscaler.is_null()) {
+					WARN_PRINT_ONCE("Custom 3D resolution scaling requires a RenderingUpscaler to be assigned to the viewport. Falling back to FSR 2 scaling.");
+				} else {
+					WARN_PRINT_ONCE(vformat("The custom upscaler '%s' is not supported by the current renderer or hardware. Falling back to FSR 2 scaling.", p_viewport->custom_upscaler->get_upscaler_name()));
+				}
+				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_FSR2;
+				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
 			}
 
 			RenderingServerEnums::ViewportMSAA msaa_3d = p_viewport->msaa_3d;
@@ -219,7 +229,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
 			}
 
-			if (scaling_3d_is_not_bilinear && scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST && !upscaler_available) {
+			if (scaling_3d_is_not_bilinear && scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST && scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM && !upscaler_available) {
 				// FSR is not actually available.
 				// Fall back to bilinear scaling.
 				WARN_PRINT_ONCE("FSR 3D resolution scaling is not available. Falling back to bilinear 3D resolution scaling.");
@@ -253,6 +263,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 				case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR:
 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
+				case RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM:
 					target_width = p_viewport->size.width;
 					target_height = p_viewport->size.height;
 					render_width = MAX(target_width * scaling_3d_scale, 1.0); // target_width / (target_width * scaling)
@@ -277,7 +288,9 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 			}
 
 			uint32_t jitter_phase_count = 0;
-			if (scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
+			if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM) {
+				jitter_phase_count = p_viewport->custom_upscaler->get_jitter_phase_count(Size2i(render_width, render_height), Size2i(target_width, target_height));
+			} else if (scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
 				// Implementation has been copied from ffxFsr2GetJitterPhaseCount.
 				// Also used for MetalFX Temporal scaling.
 				jitter_phase_count = uint32_t(8.0f * std::pow(float(target_width) / render_width, 2.0f));
@@ -299,6 +312,9 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 			rb_config.set_target_size(Size2(target_width, target_height));
 			rb_config.set_view_count(p_viewport->view_count);
 			rb_config.set_scaling_3d_mode(scaling_3d_mode);
+			if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM) {
+				rb_config.set_custom_upscaler(p_viewport->custom_upscaler);
+			}
 			rb_config.set_msaa_3d(msaa_3d);
 			rb_config.set_screen_space_aa(p_viewport->screen_space_aa);
 			rb_config.set_fsr_sharpness(p_viewport->fsr_sharpness);
@@ -1041,6 +1057,10 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
 			WARN_PRINT_ONCE_ED("MetalFX Temporal 3D scaling is only available when using the Forward+ renderer.");
 			return;
 		}
+		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM) {
+			WARN_PRINT_ONCE_ED("Custom 3D scaling is only available when using the Forward+ renderer.");
+			return;
+		}
 	}
 	if (rendering_method == "gl_compatibility" && p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL) {
 		WARN_PRINT_ONCE_ED("MetalFX Spatial 3D scaling is only available when using the Forward+ or Mobile renderer.");
@@ -1060,6 +1080,19 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
 	}
 
 	_configure_3d_render_buffers(viewport);
+}
+
+void RendererViewport::viewport_set_scaling_3d_custom_upscaler(RID p_viewport, const Ref<RenderingUpscaler> &p_upscaler) {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL(viewport);
+
+	if (viewport->custom_upscaler == p_upscaler) {
+		return;
+	}
+	viewport->custom_upscaler = p_upscaler;
+	if (viewport->scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM) {
+		_configure_3d_render_buffers(viewport);
+	}
 }
 
 void RendererViewport::viewport_set_fsr_sharpness(RID p_viewport, float p_sharpness) {

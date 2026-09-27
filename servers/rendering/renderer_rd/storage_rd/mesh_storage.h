@@ -35,6 +35,7 @@
 #include "core/templates/self_list.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_rd/shaders/skeleton.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_geometry_pool.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/mesh_storage.h"
 #include "servers/rendering/storage/utilities.h"
@@ -139,6 +140,9 @@ private:
 			RID blend_shape_buffer;
 			uint32_t blend_shape_buffer_size = 0;
 
+			// Cluster hierarchy for GPU-driven cluster LOD rendering (cluster_count == 0 when unused).
+			VirtualGeometryPool::Allocation virtual_geometry;
+
 			RID material;
 
 			uint32_t render_index = 0;
@@ -179,6 +183,8 @@ private:
 	};
 
 	mutable RID_Owner<Mesh, true> mesh_owner;
+
+	VirtualGeometryPool virtual_geometry_pool;
 
 	/* Mesh Instance API */
 
@@ -501,6 +507,21 @@ public:
 			return current_lod + 1;
 		}
 	}
+
+	/* VIRTUAL GEOMETRY */
+
+	_FORCE_INLINE_ bool mesh_surface_has_virtual_geometry(void *p_surface) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return s->virtual_geometry.cluster_count > 0;
+	}
+
+	// Returns nullptr if the surface has no virtual geometry or it isn't uploaded yet.
+	_FORCE_INLINE_ const VirtualGeometryPool::Allocation *mesh_surface_get_virtual_geometry(void *p_surface) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return s->virtual_geometry.resident ? &s->virtual_geometry : nullptr;
+	}
+
+	VirtualGeometryPool *get_virtual_geometry_pool() { return &virtual_geometry_pool; }
 
 	_FORCE_INLINE_ RID mesh_surface_get_index_array(void *p_surface, uint32_t p_lod) const {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);

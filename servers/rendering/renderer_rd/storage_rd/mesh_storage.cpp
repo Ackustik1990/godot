@@ -33,6 +33,7 @@
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_types.h"
+#include "servers/rendering/virtual_geometry_format.h"
 
 using namespace RendererRD;
 
@@ -196,6 +197,8 @@ MeshStorage::~MeshStorage() {
 	skeleton_shader.shader.version_free(skeleton_shader.version);
 
 	RD::get_singleton()->free_rid(default_rd_storage_buffer);
+
+	virtual_geometry_pool.finalize();
 
 	singleton = nullptr;
 }
@@ -438,6 +441,14 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	ERR_FAIL_COND_MSG(!new_surface.index_count && !new_surface.vertex_count, "Meshes must contain a vertex array, an index array, or both");
 
+	if (!new_surface.virtual_geometry_data.is_empty()) {
+		if (new_surface.primitive == RSE::PRIMITIVE_TRIANGLES && !(new_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES) && VirtualGeometryFormat::validate(new_surface.virtual_geometry_data.ptr(), new_surface.virtual_geometry_data.size(), new_surface.vertex_count)) {
+			virtual_geometry_pool.queue_upload(&s->virtual_geometry, new_surface.virtual_geometry_data);
+		} else {
+			WARN_PRINT(vformat("Ignoring invalid virtual geometry data in mesh surface (mesh: '%s'). Regenerate it with ArrayMesh.generate_virtual_geometry().", mesh->path));
+		}
+	}
+
 	s->aabb = new_surface.aabb;
 	s->bone_aabbs = new_surface.bone_aabbs; //only really useful for returning them.
 	s->mesh_to_skeleton_xform = p_surface.mesh_to_skeleton_xform;
@@ -545,6 +556,10 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 
 	if (s.blend_shape_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.blend_shape_buffer);
+	}
+
+	if (s.virtual_geometry.cluster_count) {
+		virtual_geometry_pool.free(&s.virtual_geometry);
 	}
 
 	memdelete(p_mesh->surfaces[p_surface]);
@@ -711,6 +726,10 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 
 	if (s.blend_shape_buffer.is_valid()) {
 		sd.blend_shape_data = RD::get_singleton()->buffer_get_data(s.blend_shape_buffer);
+	}
+
+	if (s.virtual_geometry.cluster_count) {
+		sd.virtual_geometry_data = virtual_geometry_pool.read(&s.virtual_geometry);
 	}
 
 	return sd;
@@ -994,6 +1013,7 @@ void MeshStorage::mesh_debug_usage(List<RenderingServerTypes::MeshInfo> *r_info)
 			for (uint32_t lod_index = 0; lod_index < surface->lod_count; lod_index++) {
 				mesh_info.lod_index_buffers_size += surface->lods[lod_index].index_buffer_size;
 			}
+			mesh_info.virtual_geometry_size += surface->virtual_geometry.cluster_count * sizeof(VirtualGeometryFormat::Cluster) + surface->virtual_geometry.data_count * sizeof(uint32_t);
 		}
 
 		r_info->push_back(mesh_info);

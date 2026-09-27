@@ -357,6 +357,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	s->mesh_to_skeleton_xform = p_surface.mesh_to_skeleton_xform;
 
 	s->uv_scale = new_surface.uv_scale;
+	s->virtual_geometry_data = new_surface.virtual_geometry_data;
 
 	if (new_surface.skin_data.size() || mesh->blend_shape_count > 0) {
 		// Size must match the size of the vertex array.
@@ -667,6 +668,7 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 	}
 
 	sd.uv_scale = s.uv_scale;
+	sd.virtual_geometry_data = s.virtual_geometry_data;
 
 	return sd;
 }

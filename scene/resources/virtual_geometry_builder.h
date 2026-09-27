@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  register_types.cpp                                                    */
+/*  virtual_geometry_builder.h                                            */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,45 +28,38 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "register_types.h"
+#pragma once
 
-#include "virtual_geometry_meshopt.h"
+#include "core/templates/vector.h"
+#include "core/variant/array.h"
 
-#include "scene/resources/surface_tool.h"
+struct VirtualGeometryBuildSettings {
+	uint32_t max_cluster_vertices = 128;
+	uint32_t max_cluster_triangles = 128;
+	uint32_t group_size = 16; // Target number of clusters simplified together.
+	float normal_weight = 0.5; // Weight of normals in the simplification metric.
+	bool use_threads = true;
+};
 
-#include <thirdparty/meshoptimizer/meshoptimizer.h>
+// Builds the cluster hierarchy ("virtual geometry") used by the GPU-driven
+// cluster LOD renderer. See servers/rendering/virtual_geometry_format.h.
+//
+// The actual implementation lives in the meshoptimizer module, which registers
+// build_func on initialization. When the module is disabled, virtual geometry
+// is simply not available and meshes render with their regular index buffers.
+class VirtualGeometryBuilder {
+public:
+	using Settings = VirtualGeometryBuildSettings;
 
-void initialize_meshoptimizer_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+	typedef Vector<uint8_t> (*BuildFunc)(const float *p_positions, const float *p_normals, uint32_t p_vertex_count, const uint32_t *p_indices, uint32_t p_index_count, const Settings &p_settings);
+	static BuildFunc build_func;
 
-	SurfaceTool::optimize_vertex_cache_func = meshopt_optimizeVertexCache;
-	SurfaceTool::optimize_vertex_fetch_remap_func = meshopt_optimizeVertexFetchRemap;
-	SurfaceTool::simplify_func = meshopt_simplify;
-	SurfaceTool::simplify_with_attrib_func = meshopt_simplifyWithAttributes;
-	SurfaceTool::simplify_scale_func = meshopt_simplifyScale;
-	SurfaceTool::generate_remap_func = meshopt_generateVertexRemap;
-	SurfaceTool::remap_vertex_func = meshopt_remapVertexBuffer;
-	SurfaceTool::remap_index_func = meshopt_remapIndexBuffer;
-	SurfaceTool::generate_tangents_func = meshopt_generateTangents;
+	static bool is_available() { return build_func != nullptr; }
 
-	VirtualGeometryBuilder::build_func = virtual_geometry_build_meshopt;
-}
+	// Builds virtual geometry data from surface arrays (as returned by Mesh::surface_get_arrays()).
+	// Only triangle surfaces are supported. Returns an empty vector on failure.
+	static Vector<uint8_t> build_from_arrays(const Array &p_arrays, const Settings &p_settings = Settings());
 
-void uninitialize_meshoptimizer_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
-
-	SurfaceTool::optimize_vertex_cache_func = nullptr;
-	SurfaceTool::optimize_vertex_fetch_remap_func = nullptr;
-	SurfaceTool::simplify_func = nullptr;
-	SurfaceTool::simplify_scale_func = nullptr;
-	SurfaceTool::generate_remap_func = nullptr;
-	SurfaceTool::remap_vertex_func = nullptr;
-	SurfaceTool::remap_index_func = nullptr;
-	SurfaceTool::generate_tangents_func = nullptr;
-
-	VirtualGeometryBuilder::build_func = nullptr;
-}
+	// Returns a human readable summary of a virtual geometry blob, for debugging.
+	static String get_summary(const Vector<uint8_t> &p_data);
+};

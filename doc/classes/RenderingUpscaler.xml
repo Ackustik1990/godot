@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="RenderingUpscaler" inherits="Resource" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		Base class for custom temporal 3D upscalers, such as vendor or neural network based upscalers.
+	</brief_description>
+	<description>
+		Extend this class to integrate a custom 3D upscaler (for example DLSS, XeSS, FSR 3 or later, or your own neural network) with the Forward+ renderer, without modifying the engine. Assign an instance to [member Viewport.scaling_3d_custom_upscaler] and set [member Viewport.scaling_3d_mode] to [constant Viewport.SCALING_3D_MODE_CUSTOM], or use [member ProjectSettings.rendering/scaling_3d/custom_upscaler_class] for the root viewport.
+		The renderer draws the scene at the reduced internal resolution with sub-pixel camera jitter and motion vectors, then calls [method _upscale] once per view. The implementation reads the textures from [RenderingUpscaleParameters] and records its work with the [RenderingDevice] returned by [method RenderingServer.get_rendering_device], writing the result to [method RenderingUpscaleParameters.get_output].
+		Upscalers that must call into a native SDK can return [code]true[/code] from [method _uses_native_commands]. [method _record_native_commands] is then called with the native command buffer while the frame is recorded, and the renderer takes care of the barriers of all textures in [RenderingUpscaleParameters]. Native texture handles can be obtained with [method RenderingDevice.get_driver_resource].
+		[codeblock]
+		extends RenderingUpscaler
+
+		var shader: RID
+		var pipeline: RID
+		var sampler: RID
+
+		func _get_upscaler_name():
+		    return "Bilinear example"
+
+		func _is_supported():
+		    return RenderingServer.get_rendering_device() != null
+
+		func _upscale(parameters):
+		    var rd = RenderingServer.get_rendering_device()
+		    if not shader.is_valid():
+		        pass # Compile the compute shader, create the pipeline and sampler here.
+		    var color = RDUniform.new()
+		    color.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		    color.binding = 0
+		    color.add_id(sampler)
+		    color.add_id(parameters.get_color())
+		    var output = RDUniform.new()
+		    output.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
+		    output.binding = 1
+		    output.add_id(parameters.get_output())
+		    var uniform_set = UniformSetCacheRD.get_cache(shader, 0, [color, output])
+		    var size = parameters.get_target_size()
+		    var list = rd.compute_list_begin()
+		    rd.compute_list_bind_compute_pipeline(list, pipeline)
+		    rd.compute_list_bind_uniform_set(list, uniform_set, 0)
+		    rd.compute_list_dispatch(list, (size.x + 7) / 8, (size.y + 7) / 8, 1)
+		    rd.compute_list_end()
+
+		func _notification(what):
+		    if what == NOTIFICATION_PREDELETE and shader.is_valid():
+		        var rd = RenderingServer.get_rendering_device()
+		        rd.free_rid(sampler)
+		        rd.free_rid(shader) # Also frees the pipeline.
+		[/codeblock]
+		[b]Note:[/b] Custom upscalers are only available in the Forward+ renderer. When an upscaler isn't assigned or [method is_supported] returns [code]false[/code], the viewport falls back to FSR 2.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="_get_jitter_phase_count" qualifiers="virtual const">
+			<return type="int" />
+			<param index="0" name="render_size" type="Vector2i" />
+			<param index="1" name="target_size" type="Vector2i" />
+			<description>
+				Returns the length of the camera jitter sequence for the given internal and output sizes. If not overridden or if [code]0[/code] is returned, the sequence length recommended for FSR 2 is used ([code]8 * (target_width / render_width)²[/code]), which suits most temporal upscalers.
+			</description>
+		</method>
+		<method name="_get_upscaler_name" qualifiers="virtual const">
+			<return type="String" />
+			<description>
+				Returns a human readable name for the upscaler, used in messages. Defaults to the class name.
+			</description>
+		</method>
+		<method name="_is_supported" qualifiers="virtual const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if the upscaler can run with the current renderer, graphics API and hardware. If not overridden, the upscaler is considered supported when [method _upscale] or [method _record_native_commands] is implemented.
+			</description>
+		</method>
+		<method name="_record_native_commands" qualifiers="virtual">
+			<return type="void" />
+			<param index="0" name="command_buffer" type="int" />
+			<param index="1" name="parameters" type="RenderingUpscaleParameters" />
+			<description>
+				Called instead of [method _upscale] when [method _uses_native_commands] returns [code]true[/code]. [param command_buffer] is the native handle of the command buffer being recorded: a [code]VkCommandBuffer[/code] with Vulkan or an [code]ID3D12GraphicsCommandList[/code] with Direct3D 12 (it is [code]0[/code] on other graphics APIs). Record the upscaling work directly into it. All textures in [param parameters] are in a state suitable for sampling, except the output which is ready for storage writes.
+				[b]Note:[/b] This is called on the rendering thread, possibly after [method _upscale] would have been called, while the frame is submitted. It must not call [RenderingDevice] methods.
+			</description>
+		</method>
+		<method name="_upscale" qualifiers="virtual">
+			<return type="void" />
+			<param index="0" name="parameters" type="RenderingUpscaleParameters" />
+			<description>
+				Records the upscaling of one view. Read the inputs from [param parameters] and write the upscaled image to [method RenderingUpscaleParameters.get_output] using the [RenderingDevice]. Called on the rendering thread once per view and frame.
+			</description>
+		</method>
+		<method name="_uses_native_commands" qualifiers="virtual const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] to receive the native command buffer in [method _record_native_commands] instead of using [method _upscale]. Useful to integrate SDKs that record their own GPU commands.
+			</description>
+		</method>
+		<method name="get_upscaler_name" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the name of the upscaler, see [method _get_upscaler_name].
+			</description>
+		</method>
+		<method name="is_supported" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if the upscaler can be used, see [method _is_supported].
+			</description>
+		</method>
+	</methods>
+</class>

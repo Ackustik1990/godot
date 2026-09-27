@@ -3458,6 +3458,9 @@
 			A larger number is more efficient up to a limit, after that it will only waste RAM (maximum efficiency is achieved when there is no more than 1 pool per frame). A small number could end up with one pool per descriptor, which negatively impacts performance.
 			[b]Note:[/b] Changing this property requires a restart to take effect.
 		</member>
+		<member name="rendering/scaling_3d/custom_upscaler_class" type="String" setter="" getter="" default="&quot;&quot;">
+			The class name of the [RenderingUpscaler] used by the root viewport and new viewports when [member rendering/scaling_3d/mode] is set to [b]Custom[/b]. It can be a native class, a GDExtension class or a script class with a global class name. See [member Viewport.scaling_3d_custom_upscaler].
+		</member>
 		<member name="rendering/scaling_3d/fsr_sharpness" type="float" setter="" getter="" default="0.2">
 			Determines how sharp the upscaled image will be when using the FSR upscaling mode. Sharpness halves with every whole number. Values go from 0.0 (sharpest) to 2.0. Values above 2.0 won't make a visible difference.
 		</member>
@@ -3592,6 +3595,12 @@
 		</member>
 		<member name="rendering/viewport/transparent_background" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], enables [member Viewport.transparent_bg] on the root viewport. This allows per-pixel transparency to be effective after also enabling [member display/window/size/transparent] and [member display/window/per_pixel_transparency/allowed].
+		</member>
+		<member name="rendering/virtual_geometry/enabled" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], surfaces with virtual geometry (see [method ArrayMesh.generate_virtual_geometry]) use GPU-driven cluster level of detail and culling in the Forward+ renderer. If [code]false[/code], they are always drawn at full detail with their regular index buffer. Can be changed at runtime.
+		</member>
+		<member name="rendering/virtual_geometry/max_index_buffer_size" type="int" setter="" getter="" default="64">
+			The maximum size, in millions of indices (4 bytes each), of the index buffer that holds the triangles selected by virtual geometry for a batch of views (the camera, or all shadow maps rendered together). The buffers grow automatically up to this size; if the selected triangles don't fit, some instances are skipped for that frame.
 		</member>
 		<member name="rendering/vrs/mode" type="int" setter="" getter="" default="0">
 			Set the default Variable Rate Shading (VRS) mode for the main viewport. See [member Viewport.vrs_mode] to change this at runtime, and [enum Viewport.VRSMode] for possible values.

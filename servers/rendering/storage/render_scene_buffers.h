@@ -32,6 +32,7 @@
 
 #include "core/object/ref_counted.h"
 #include "servers/rendering/rendering_server_enums.h"
+#include "servers/rendering/rendering_upscaler.h"
 
 class RenderSceneBuffersConfiguration : public RefCounted {
 	GDCLASS(RenderSceneBuffersConfiguration, RefCounted);
@@ -50,6 +51,7 @@ private:
 
 	float fsr_sharpness = 0.0;
 	float texture_mipmap_bias = 0.0;
+	Ref<RenderingUpscaler> custom_upscaler;
 	bool use_taa = false;
 	bool use_debanding = false;
 
@@ -80,6 +82,9 @@ public:
 
 	float get_fsr_sharpness() const { return fsr_sharpness; }
 	void set_fsr_sharpness(float p_fsr_sharpness) { fsr_sharpness = p_fsr_sharpness; }
+
+	Ref<RenderingUpscaler> get_custom_upscaler() const { return custom_upscaler; }
+	void set_custom_upscaler(const Ref<RenderingUpscaler> &p_upscaler) { custom_upscaler = p_upscaler; }
 
 	float get_texture_mipmap_bias() const { return texture_mipmap_bias; }
 	void set_texture_mipmap_bias(float p_texture_mipmap_bias) { texture_mipmap_bias = p_texture_mipmap_bias; }

@@ -107,6 +107,10 @@ struct SurfaceData {
 
 	Vector4 uv_scale;
 
+	// Optional cluster hierarchy used by the GPU-driven cluster LOD renderer.
+	// See servers/rendering/virtual_geometry_format.h.
+	Vector<uint8_t> virtual_geometry_data;
+
 	RID material;
 };
 
@@ -119,6 +123,7 @@ struct MeshInfo {
 	uint32_t index_buffer_size = 0;
 	uint32_t blend_shape_buffer_size = 0;
 	uint32_t lod_index_buffers_size = 0;
+	uint32_t virtual_geometry_size = 0;
 	uint64_t vertex_count = 0;
 };
 

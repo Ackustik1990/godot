@@ -1443,6 +1443,11 @@
 			- Vulkan: [code]VkPipeline[/code].
 			- Metal: [code]MTLRenderPipelineState[/code].
 		</constant>
+		<constant name="DRIVER_RESOURCE_COMMAND_BUFFER" value="13" enum="DriverResource">
+			Command buffer being recorded. Only meaningful inside driver callbacks, such as [method RenderingUpscaler._record_native_commands].
+			- Vulkan: [code]VkCommandBuffer[/code].
+			- D3D12: [code]ID3D12GraphicsCommandList[/code].
+		</constant>
 		<constant name="DRIVER_RESOURCE_VULKAN_DEVICE" value="0" enum="DriverResource" deprecated="Use [constant DRIVER_RESOURCE_LOGICAL_DEVICE] instead.">
 		</constant>
 		<constant name="DRIVER_RESOURCE_VULKAN_PHYSICAL_DEVICE" value="1" enum="DriverResource" deprecated="Use [constant DRIVER_RESOURCE_PHYSICAL_DEVICE] instead.">

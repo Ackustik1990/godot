@@ -117,6 +117,9 @@ struct Mesh {
 
 		Vector4 uv_scale;
 
+		// Not used by this renderer, kept so it's preserved when the mesh is saved.
+		Vector<uint8_t> virtual_geometry_data;
+
 		struct BlendShape {
 			GLuint vertex_buffer = 0;
 			GLuint vertex_array = 0;

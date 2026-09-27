@@ -7293,6 +7293,10 @@ uint64_t RenderingDeviceDriverVulkan::get_resource_native_handle(DriverResource 
 		case DRIVER_RESOURCE_RENDER_PIPELINE: {
 			return p_driver_id.id;
 		}
+		case DRIVER_RESOURCE_COMMAND_BUFFER: {
+			const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_driver_id.id;
+			return command_buffer ? (uint64_t)command_buffer->vk_command_buffer : 0;
+		}
 		default: {
 			return 0;
 		}

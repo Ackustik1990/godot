@@ -52,7 +52,7 @@ void RenderSceneBuffersConfiguration::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_scaling_3d_mode"), &RenderSceneBuffersConfiguration::get_scaling_3d_mode);
 	ClassDB::bind_method(D_METHOD("set_scaling_3d_mode", "scaling_3d_mode"), &RenderSceneBuffersConfiguration::set_scaling_3d_mode);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4"), "set_scaling_3d_mode", "get_scaling_3d_mode"); // TODO VIEWPORT_SCALING_3D_MODE_OFF is possible here too, but we can't specify an enum string for it.
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4,Custom (RenderingUpscaler):6"), "set_scaling_3d_mode", "get_scaling_3d_mode"); // TODO VIEWPORT_SCALING_3D_MODE_OFF is possible here too, but we can't specify an enum string for it.
 
 	ClassDB::bind_method(D_METHOD("get_msaa_3d"), &RenderSceneBuffersConfiguration::get_msaa_3d);
 	ClassDB::bind_method(D_METHOD("set_msaa_3d", "msaa_3d"), &RenderSceneBuffersConfiguration::set_msaa_3d);
@@ -61,6 +61,10 @@ void RenderSceneBuffersConfiguration::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_screen_space_aa"), &RenderSceneBuffersConfiguration::get_screen_space_aa);
 	ClassDB::bind_method(D_METHOD("set_screen_space_aa", "screen_space_aa"), &RenderSceneBuffersConfiguration::set_screen_space_aa);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "screen_space_aa", PROPERTY_HINT_ENUM, "Disabled,FXAA,SMAA"), "set_screen_space_aa", "get_screen_space_aa");
+
+	ClassDB::bind_method(D_METHOD("get_custom_upscaler"), &RenderSceneBuffersConfiguration::get_custom_upscaler);
+	ClassDB::bind_method(D_METHOD("set_custom_upscaler", "upscaler"), &RenderSceneBuffersConfiguration::set_custom_upscaler);
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "custom_upscaler", PROPERTY_HINT_RESOURCE_TYPE, "RenderingUpscaler"), "set_custom_upscaler", "get_custom_upscaler");
 
 	ClassDB::bind_method(D_METHOD("get_fsr_sharpness"), &RenderSceneBuffersConfiguration::get_fsr_sharpness);
 	ClassDB::bind_method(D_METHOD("set_fsr_sharpness", "fsr_sharpness"), &RenderSceneBuffersConfiguration::set_fsr_sharpness);

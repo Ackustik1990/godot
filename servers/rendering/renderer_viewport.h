@@ -56,6 +56,7 @@ public:
 		RID scenario;
 
 		RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
+		Ref<RenderingUpscaler> custom_upscaler;
 		float scaling_3d_scale = 1.0;
 		float fsr_sharpness = 0.2f;
 		float texture_mipmap_bias = 0.0f;
@@ -233,6 +234,7 @@ public:
 	void viewport_set_parent_viewport(RID p_viewport, RID p_parent_viewport);
 
 	void viewport_set_scaling_3d_mode(RID p_viewport, RSE::ViewportScaling3DMode p_mode);
+	void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, const Ref<RenderingUpscaler> &p_upscaler);
 	void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale);
 	void viewport_set_fsr_sharpness(RID p_viewport, float p_sharpness);
 	void viewport_set_texture_mipmap_bias(RID p_viewport, float p_mipmap_bias);

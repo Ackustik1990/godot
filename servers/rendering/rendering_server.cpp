@@ -1990,6 +1990,10 @@ static RenderingServerTypes::SurfaceData _dict_to_surf(const Dictionary &p_dicti
 		sd.blend_shape_data = p_dictionary["blend_shape_data"];
 	}
 
+	if (p_dictionary.has("virtual_geometry_data")) {
+		sd.virtual_geometry_data = p_dictionary["virtual_geometry_data"];
+	}
+
 	if (p_dictionary.has("material")) {
 		sd.material = p_dictionary["material"];
 	}
@@ -2048,6 +2052,10 @@ Dictionary RenderingServer::_mesh_get_surface(RID p_mesh, int p_idx) {
 
 	if (sd.blend_shape_data.size()) {
 		d["blend_shape_data"] = sd.blend_shape_data;
+	}
+
+	if (sd.virtual_geometry_data.size()) {
+		d["virtual_geometry_data"] = sd.virtual_geometry_data;
 	}
 
 	if (sd.material.is_valid()) {
@@ -2875,6 +2883,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("viewport_set_canvas_cull_mask", "viewport", "canvas_cull_mask"), &RenderingServer::viewport_set_canvas_cull_mask);
 
 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_mode", "viewport", "scaling_3d_mode"), &RenderingServer::viewport_set_scaling_3d_mode);
+	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_custom_upscaler", "viewport", "upscaler"), &RenderingServer::viewport_set_scaling_3d_custom_upscaler);
 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_scale", "viewport", "scale"), &RenderingServer::viewport_set_scaling_3d_scale);
 	ClassDB::bind_method(D_METHOD("viewport_set_fsr_sharpness", "viewport", "sharpness"), &RenderingServer::viewport_set_fsr_sharpness);
 	ClassDB::bind_method(D_METHOD("viewport_set_texture_mipmap_bias", "viewport", "mipmap_bias"), &RenderingServer::viewport_set_texture_mipmap_bias);
@@ -2935,6 +2944,7 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
+	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_MAX);
 
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_UPDATE_DISABLED);
@@ -3701,6 +3711,9 @@ void RenderingServer::init() {
 
 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/lights_and_shadows/multi_bounce_occlusion/enabled"), false);
 
+	GLOBAL_DEF("rendering/virtual_geometry/enabled", true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/virtual_geometry/max_index_buffer_size", PROPERTY_HINT_RANGE, "1,1024,1,suffix:M indices"), 64);
+
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality", PROPERTY_HINT_ENUM, "Hard (Fastest),Soft Very Low (Faster),Soft Low (Fast),Soft Medium (Average),Soft High (Slow),Soft Ultra (Slowest)"), 2);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality.mobile", 0);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/atlas_16_bits", true);
@@ -3779,7 +3792,7 @@ void RenderingServer::init() {
 		String mode_hints;
 		String mode_hints_metal;
 		{
-			Vector<String> mode_hints_arr = { "Nearest (Fastest):5", "Bilinear (Fastest):0", "FSR 1.0 (Fast):1", "FSR 2.2 (Slow):2" };
+			Vector<String> mode_hints_arr = { "Nearest (Fastest):5", "Bilinear (Fastest):0", "FSR 1.0 (Fast):1", "FSR 2.2 (Slow):2", "Custom (RenderingUpscaler):6" };
 			mode_hints = String(",").join(mode_hints_arr);
 
 			mode_hints_arr.push_back("MetalFX (Spatial - Fast):3");
@@ -3792,6 +3805,7 @@ void RenderingServer::init() {
 		GLOBAL_DEF_NOVAL(PropertyInfo(Variant::INT, "rendering/scaling_3d/mode.macos", PROPERTY_HINT_ENUM, mode_hints_metal), 0);
 	}
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/scaling_3d/scale", PROPERTY_HINT_RANGE, "0.1,2.0,0.0001"), 1.0);
+	GLOBAL_DEF(PropertyInfo(Variant::STRING, "rendering/scaling_3d/custom_upscaler_class", PROPERTY_HINT_TYPE_STRING, "RenderingUpscaler"), "");
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/scaling_3d/fsr_sharpness", PROPERTY_HINT_RANGE, "0,2,0.01"), 0.2f);
 
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/textures/default_filters/texture_mipmap_bias", PROPERTY_HINT_RANGE, "-2,2,0.001"), 0.0f);

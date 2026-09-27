@@ -39,6 +39,7 @@
 #include "core/templates/pass_func.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
+#include "servers/rendering/frustum_cull_simd.h"
 #include "servers/rendering/instance_uniforms.h"
 #include "servers/rendering/renderer_scene_occlusion_cull.h"
 #include "servers/rendering/renderer_scene_render.h"
@@ -165,6 +166,7 @@ public:
 		const Plane *planes_ptr;
 		const PlaneSign *plane_signs_ptr;
 		uint32_t plane_count;
+		FrustumCullSIMD simd; // Structure of arrays copy of the planes for the SIMD test.
 
 		_ALWAYS_INLINE_ Frustum() {}
 		_ALWAYS_INLINE_ Frustum(const Frustum &p_frustum) {
@@ -174,6 +176,7 @@ public:
 			planes_ptr = planes.ptr();
 			plane_signs_ptr = plane_signs.ptr();
 			plane_count = p_frustum.plane_count;
+			simd = p_frustum.simd;
 		}
 		_ALWAYS_INLINE_ void operator=(const Frustum &p_frustum) {
 			planes = p_frustum.planes;
@@ -182,6 +185,7 @@ public:
 			planes_ptr = planes.ptr();
 			plane_signs_ptr = plane_signs.ptr();
 			plane_count = p_frustum.plane_count;
+			simd = p_frustum.simd;
 		}
 		_ALWAYS_INLINE_ Frustum(const Vector<Plane> &p_planes) {
 			planes = p_planes;
@@ -193,6 +197,7 @@ public:
 			}
 
 			plane_signs_ptr = plane_signs.ptr();
+			simd.setup(planes_ptr, plane_count);
 		}
 	};
 
@@ -215,6 +220,15 @@ public:
 		_ALWAYS_INLINE_ bool in_frustum(const Frustum &p_frustum) const {
 			// This is not a full SAT check and the possibility of false positives exist,
 			// but the tradeoff vs performance is still very good.
+
+#ifndef REAL_T_IS_DOUBLE
+			if constexpr (FrustumCullSIMD::has_simd) {
+				// Same test, evaluated for 4 planes at a time (about 2x faster).
+				if (likely(p_frustum.simd.valid)) {
+					return p_frustum.simd.box_in_frustum(bounds);
+				}
+			}
+#endif
 
 			for (uint32_t i = 0; i < p_frustum.plane_count; i++) {
 				Vector3 min(

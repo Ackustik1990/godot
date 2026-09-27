@@ -32,11 +32,13 @@
 
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
+#include "servers/rendering/render_list_radix_sort.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
+#include "servers/rendering/renderer_rd/effects/virtual_geometry.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
@@ -239,6 +241,11 @@ private:
 		bool use_directional_soft_shadow = false;
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
 		bool use_material_feedback = false;
+
+		// Virtual geometry: per element draw index into vg_command_buffer (VirtualGeometry::INVALID_DRAW for regular draws).
+		const uint32_t *vg_draws = nullptr;
+		RID vg_command_buffer;
+		RID vg_index_array;
 
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}, bool p_use_material_feedback = false) {
 			elements = p_elements;
@@ -452,6 +459,10 @@ private:
 			bool flip_cull;
 
 			uint32_t uniform_buffer_index;
+
+			// Virtual geometry culling view for this pass.
+			RendererRD::VirtualGeometry::ViewParams vg_view;
+			bool vg_reverse_cull_face;
 		};
 
 		LocalVector<ShadowPass> shadow_passes;
@@ -519,6 +530,7 @@ private:
 			FLAG_USES_PARTICLE_TRAILS = 65536,
 			FLAG_USES_MOTION_VECTOR = 131072,
 			FLAG_USES_STENCIL = 262144,
+			FLAG_USES_VIRTUAL_GEOMETRY = 524288,
 		};
 
 		union {
@@ -563,6 +575,10 @@ private:
 		void *surface_shadow = nullptr;
 		RID material_uniform_set_shadow;
 		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
+
+		// Virtual geometry job of the current main view batch, shared by the depth, opaque and motion passes.
+		uint64_t vg_batch_id = 0;
+		uint32_t vg_draw = 0;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
 		GeometryInstanceForwardClustered *owner = nullptr;
@@ -702,13 +718,14 @@ private:
 	struct RenderList {
 		LocalVector<GeometryInstanceSurfaceDataCache *> elements;
 		LocalVector<RenderElementInfo> element_info;
+		LocalVector<uint32_t> vg_draws; // Virtual geometry draw per element, only filled when used.
+		RenderListRadixSorter radix_sorter;
 
 		void clear() {
 			elements.clear();
 			element_info.clear();
+			vg_draws.clear();
 		}
-
-		//should eventually be replaced by radix
 
 		struct SortByKey {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
@@ -717,13 +734,17 @@ private:
 		};
 
 		void sort_by_key() {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr(), elements.size());
+			sort_by_key_range(0, elements.size());
 		}
 
 		void sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr() + p_from, p_size);
+			if (p_size >= RENDER_LIST_RADIX_SORT_THRESHOLD) {
+				// Large lists: stable radix sort, about 3x faster than introsort at 10k elements.
+				radix_sorter.sort(elements.ptr() + p_from, p_size);
+			} else {
+				SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
+				sorter.sort(elements.ptr() + p_from, p_size);
+			}
 		}
 
 		struct SortByDepth {
@@ -770,6 +791,22 @@ private:
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
+	/* Virtual geometry */
+
+	RendererRD::VirtualGeometry *virtual_geometry = nullptr;
+	bool virtual_geometry_active = false;
+	uint64_t virtual_geometry_batch_id = 0;
+	RID virtual_geometry_main_commands;
+	RID virtual_geometry_main_indices;
+	RID virtual_geometry_shadow_commands;
+	RID virtual_geometry_shadow_indices;
+
+	_FORCE_INLINE_ bool _virtual_geometry_is_eligible(const GeometryInstanceSurfaceDataCache *p_surface) const;
+	uint32_t _virtual_geometry_get_job_flags(const GeometryInstanceSurfaceDataCache *p_surface, bool p_shadow, bool p_reverse_cull_face) const;
+	void _virtual_geometry_setup_main(const RenderDataRD *p_render_data);
+	void _virtual_geometry_setup_shadows();
+	void _virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array);
+
 	/* Cluster builder */
 
 	ClusterBuilderSharedDataRD cluster_builder_shared;
@@ -799,6 +836,12 @@ private:
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_sscs, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
+
+	/* Custom (e.g. neural network) upscalers */
+	LocalVector<void *> native_upscale_calls;
+	uint64_t native_upscale_frame = 0;
+	void _process_custom_upscaler(RenderDataRD *p_render_data);
+	void _free_native_upscale_calls();
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

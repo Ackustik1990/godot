@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="RenderingUpscaleParameters" inherits="RefCounted" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		Inputs and outputs of a custom upscaler for one view.
+	</brief_description>
+	<description>
+		Passed to [method RenderingUpscaler._upscale] and [method RenderingUpscaler._record_native_commands]. The texture [RID]s belong to the renderer and are only valid during these calls.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_camera_transform" qualifiers="const">
+			<return type="Transform3D" />
+			<description>
+				Returns the camera transform of the current frame.
+			</description>
+		</method>
+		<method name="get_color" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns the HDR scene color at the internal resolution, rendered with a jittered projection.
+			</description>
+		</method>
+		<method name="get_delta_time" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the time since the previous frame, in seconds.
+			</description>
+		</method>
+		<method name="get_depth" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns the depth buffer at the internal resolution. Godot uses reversed Z: the near plane is [code]1.0[/code] and the far plane is [code]0.0[/code].
+			</description>
+		</method>
+		<method name="get_exposure" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns a 1×1 [code]R32F[/code] texture with the auto exposure luminance, or an invalid [RID] when auto exposure is disabled.
+			</description>
+		</method>
+		<method name="get_fov_y" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the vertical field of view of the camera, in radians.
+			</description>
+		</method>
+		<method name="get_frame" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the index of the frame being rendered.
+			</description>
+		</method>
+		<method name="get_jitter" qualifiers="const">
+			<return type="Vector2" />
+			<description>
+				Returns the sub-pixel jitter applied to the projection of this frame, in pixels of the internal resolution.
+			</description>
+		</method>
+		<method name="get_output" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns the storage texture that must receive the upscaled image, at the target resolution.
+			</description>
+		</method>
+		<method name="get_previous_camera_transform" qualifiers="const">
+			<return type="Transform3D" />
+			<description>
+				Returns the camera transform of the previous frame.
+			</description>
+		</method>
+		<method name="get_previous_projection" qualifiers="const">
+			<return type="Projection" />
+			<description>
+				Returns the projection of the previous frame for this view.
+			</description>
+		</method>
+		<method name="get_projection" qualifiers="const">
+			<return type="Projection" />
+			<description>
+				Returns the projection of the current frame for this view.
+			</description>
+		</method>
+		<method name="get_reactive" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns an optional mask at the internal resolution where higher values mark pixels that should rely less on history (for example transparent surfaces), or an invalid [RID].
+			</description>
+		</method>
+		<method name="get_render_size" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				Returns the internal resolution the scene was rendered at.
+			</description>
+		</method>
+		<method name="get_reprojection" qualifiers="const">
+			<return type="Projection" />
+			<description>
+				Returns the matrix that transforms clip space positions of this frame (with Vulkan depth correction) into clip space positions of the previous frame, which can be used to reproject pixels that don't have motion vectors.
+			</description>
+		</method>
+		<method name="get_reset" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] when the history must be discarded, for example on the first frame after the render buffers were (re)created.
+			</description>
+		</method>
+		<method name="get_sharpness" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the sharpness requested with [member Viewport.fsr_sharpness].
+			</description>
+		</method>
+		<method name="get_target_size" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				Returns the output resolution.
+			</description>
+		</method>
+		<method name="get_velocity" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns the motion vectors at the internal resolution. Each pixel stores [code]previous_uv - current_uv[/code] in normalized texture coordinates; multiply by [method get_render_size] to obtain pixels.
+			</description>
+		</method>
+		<method name="get_view" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the index of the view being upscaled, for multiview (XR) rendering.
+			</description>
+		</method>
+		<method name="get_view_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of views rendered this frame.
+			</description>
+		</method>
+		<method name="get_z_far" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the distance of the far plane of the camera.
+			</description>
+		</method>
+		<method name="get_z_near" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the distance of the near plane of the camera.
+			</description>
+		</method>
+	</methods>
+</class>
