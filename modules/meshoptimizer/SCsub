@@ -17,6 +17,7 @@ thirdparty_sources = [
     "indexanalyzer.cpp",
     "indexcodec.cpp",
     "indexgenerator.cpp",
+    "meshletutils.cpp",
     "overdrawoptimizer.cpp",
     "partition.cpp",
     "quantization.cpp",

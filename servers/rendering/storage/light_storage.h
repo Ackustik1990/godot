@@ -63,6 +63,13 @@ public:
 	virtual void light_set_reverse_cull_face_mode(RID p_light, bool p_enabled) = 0;
 	virtual void light_set_shadow_caster_mask(RID p_light, uint32_t p_caster_mask) = 0;
 	virtual uint32_t light_get_shadow_caster_mask(RID p_light) const = 0;
+	// Positional shadow caching (see `RenderingServer::light_set_shadow_caching()`).
+	// Only implemented by renderers that support it (Forward+); the defaults make it a no-op elsewhere.
+	virtual void light_set_shadow_caching(RID p_light, bool p_enabled) {}
+	virtual void light_set_shadow_dynamic_update_interval(RID p_light, int p_frames) {}
+	// Returns `true` only if the light is an omni/spot light with caching enabled and the active renderer supports it.
+	virtual bool light_get_shadow_caching(RID p_light) const { return false; }
+	virtual int light_get_shadow_dynamic_update_interval(RID p_light) const { return 1; }
 	virtual void light_set_bake_mode(RID p_light, RSE::LightBakeMode p_bake_mode) = 0;
 	virtual void light_set_max_sdfgi_cascade(RID p_light, uint32_t p_cascade) = 0;
 	virtual void light_set_allow_contact_shadows(RID p_light, bool p_enable) = 0;
@@ -208,6 +215,12 @@ public:
 	virtual void shadow_atlas_set_size(RID p_atlas, int p_size, bool p_use_16_bits = true) = 0;
 	virtual void shadow_atlas_set_quadrant_subdivision(RID p_atlas, int p_quadrant, int p_subdivision) = 0;
 	virtual bool shadow_atlas_update_light(RID p_atlas, RID p_light_instance, float p_coverage, uint64_t p_light_version) = 0;
+	// Positional shadow static cache (only used when `light_get_shadow_caching()` returns `true`).
+	// Called before any light is updated in the atlas on a frame where a light using the cache is visible.
+	virtual void shadow_atlas_enable_static_cache(RID p_atlas) {}
+	// Returns `true` if the static cache of the light must be redrawn (never drawn, new atlas slot, or `p_static_version`
+	// changed). The caller must then draw it this frame, as `p_static_version` is recorded as the cached version.
+	virtual bool shadow_atlas_update_light_static_cache(RID p_atlas, RID p_light_instance, uint64_t p_static_version) { return true; }
 
 	virtual void shadow_atlas_update(RID p_atlas) = 0;
 

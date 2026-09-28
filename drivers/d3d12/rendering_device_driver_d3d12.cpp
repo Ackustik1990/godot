@@ -5986,6 +5986,10 @@ uint64_t RenderingDeviceDriverD3D12::get_resource_native_handle(DriverResource p
 		case DRIVER_RESOURCE_RENDER_PIPELINE: {
 			return p_driver_id.id;
 		}
+		case DRIVER_RESOURCE_COMMAND_BUFFER: {
+			const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_driver_id.id;
+			return command_buffer ? (uint64_t)command_buffer->cmd_list.Get() : 0;
+		}
 		default: {
 			return 0;
 		}

@@ -221,7 +221,7 @@ void RendererSceneCull::_instance_pair(Instance *p_A, Instance *p_B) {
 		light->geometries.insert(A);
 
 		if (geom->can_cast_shadows) {
-			light->make_shadow_dirty();
+			light->make_shadow_dirty_for_caster(A);
 		}
 
 		if (A->scenario && A->array_index >= 0) {
@@ -346,7 +346,7 @@ void RendererSceneCull::_instance_unpair(Instance *p_A, Instance *p_B) {
 		light->geometries.erase(A);
 
 		if (geom->can_cast_shadows) {
-			light->make_shadow_dirty();
+			light->make_shadow_dirty_for_caster(A);
 		}
 
 		if (A->scenario && A->array_index >= 0) {
@@ -973,7 +973,7 @@ void RendererSceneCull::instance_set_layer_mask(RID p_instance, uint32_t p_mask)
 		if (geom->can_cast_shadows) {
 			for (HashSet<RendererSceneCull::Instance *>::Iterator I = geom->lights.begin(); I != geom->lights.end(); ++I) {
 				InstanceLightData *light = static_cast<InstanceLightData *>((*I)->base_data);
-				light->make_shadow_dirty();
+				light->make_shadow_dirty_for_caster(instance);
 			}
 		}
 	}
@@ -1373,6 +1373,28 @@ void RendererSceneCull::instance_geometry_set_cast_shadows_setting(RID p_instanc
 	_instance_queue_update(instance, false, true);
 }
 
+void RendererSceneCull::instance_geometry_set_shadow_mobility(RID p_instance, RSE::ShadowMobility p_shadow_mobility) {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(instance);
+
+	const bool is_static = p_shadow_mobility == RSE::SHADOW_MOBILITY_STATIC;
+	if (instance->shadow_mobility_static == is_static) {
+		return;
+	}
+	instance->shadow_mobility_static = is_static;
+
+	if ((1 << instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK && instance->base_data) {
+		// The caster moves between the static and dynamic caster lists of the lights it's paired with.
+		InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
+		if (geom->can_cast_shadows) {
+			for (const Instance *E : geom->lights) {
+				InstanceLightData *light = static_cast<InstanceLightData *>(E->base_data);
+				light->make_static_shadow_dirty();
+			}
+		}
+	}
+}
+
 void RendererSceneCull::instance_geometry_set_material_override(RID p_instance, RID p_material) {
 	Instance *instance = instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL(instance);
@@ -1645,7 +1667,7 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 
 		RSG::light_storage->light_instance_set_transform(light->instance, *instance_xform);
 		RSG::light_storage->light_instance_set_aabb(light->instance, instance_xform->xform(p_instance->aabb));
-		light->make_shadow_dirty();
+		light->make_static_shadow_dirty();
 
 		RSE::LightBakeMode bake_mode = RSG::light_storage->light_get_bake_mode(p_instance->base);
 		if (RSG::light_storage->light_get_type(p_instance->base) != RSE::LIGHT_DIRECTIONAL && bake_mode != light->bake_mode) {
@@ -1735,7 +1757,7 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 		if (geom->can_cast_shadows) {
 			for (const Instance *E : geom->lights) {
 				InstanceLightData *light = static_cast<InstanceLightData *>(E->base_data);
-				light->make_shadow_dirty();
+				light->make_shadow_dirty_for_caster(p_instance);
 			}
 		}
 
@@ -2391,6 +2413,44 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 	}
 }
 
+bool RendererSceneCull::_light_instance_schedule_static_shadow_cache(InstanceLightData *p_light, RID p_shadow_atlas) {
+	p_light->static_shadow_version_scheduled = p_light->static_shadow_version;
+	return RSG::light_storage->shadow_atlas_update_light_static_cache(p_shadow_atlas, p_light->instance, p_light->static_shadow_version);
+}
+
+void RendererSceneCull::_light_instance_extract_static_shadow_casters(PagedArray<Instance *> &r_casters, RendererSceneRender::RenderShadowData &r_shadow_data, bool p_update_static_cache, uint32_t p_caster_mask) {
+	// Moves the static shadow casters out of `r_casters`, so only the dynamic ones are drawn every time the shadow
+	// is updated. The static ones are only added to `r_shadow_data.static_instances` when the static cache must be updated.
+	r_shadow_data.use_static_cache = true;
+	r_shadow_data.update_static_cache = p_update_static_cache;
+
+	uint64_t i = 0;
+	while (i < r_casters.size()) {
+		Instance *instance = r_casters[i];
+		if (!instance->is_static_shadow_caster() || !((1 << instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK)) {
+			i++;
+			continue;
+		}
+
+		InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
+		if (geom->material_is_animated) {
+			// Animated materials can change the shadow on every frame, keep drawing them as dynamic casters.
+			i++;
+			continue;
+		}
+
+		if (p_update_static_cache && instance->visible && geom->can_cast_shadows && (p_caster_mask & instance->layer_mask)) {
+			if (instance->mesh_instance.is_valid()) {
+				RSG::mesh_storage->mesh_instance_check_for_update(instance->mesh_instance);
+			}
+			r_shadow_data.static_instances.push_back(geom->geometry_instance);
+		}
+
+		// Replaced by the last element, so don't advance.
+		r_casters.remove_at_unordered(i);
+	}
+}
+
 bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers) {
 	InstanceLightData *light = static_cast<InstanceLightData *>(p_instance->base_data);
 
@@ -2398,6 +2458,12 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 	light_transform.orthonormalize(); //scale does not count on lights
 
 	bool animated_material_found = false;
+
+	// Positional shadow static cache: static casters are drawn into a separate cached depth map only when they change,
+	// dynamic casters are drawn on top of a copy of it (see `RenderingServer::instance_geometry_set_shadow_mobility()`).
+	const bool use_static_cache = RSG::light_storage->light_get_shadow_caching(p_instance->base);
+	const uint32_t static_caster_mask = use_static_cache ? p_visible_layers & RSG::light_storage->light_get_shadow_caster_mask(p_instance->base) : 0;
+	bool update_static_cache = false;
 
 	switch (RSG::light_storage->light_get_type(p_instance->base)) {
 		case RSE::LIGHT_DIRECTIONAL: {
@@ -2408,6 +2474,9 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 			if (shadow_mode == RSE::LIGHT_OMNI_SHADOW_DUAL_PARABOLOID || !RSG::light_storage->light_instances_can_render_shadow_cube()) {
 				if (max_shadows_used + 2 > MAX_UPDATE_SHADOWS) {
 					return true;
+				}
+				if (use_static_cache) {
+					update_static_cache = _light_instance_schedule_static_shadow_cache(light, p_shadow_atlas);
 				}
 				for (int i = 0; i < 2; i++) {
 					//using this one ensures that raster deferred will have it
@@ -2445,6 +2514,10 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 
 					RendererSceneRender::RenderShadowData &shadow_data = render_shadow_data[max_shadows_used++];
 
+					if (use_static_cache) {
+						_light_instance_extract_static_shadow_casters(instance_shadow_cull_result, shadow_data, update_static_cache, static_caster_mask);
+					}
+
 					if (!light->is_shadow_update_full()) {
 						light_culler->cull_regular_light(instance_shadow_cull_result);
 					}
@@ -2477,6 +2550,9 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 
 				if (max_shadows_used + 6 > MAX_UPDATE_SHADOWS) {
 					return true;
+				}
+				if (use_static_cache) {
+					update_static_cache = _light_instance_schedule_static_shadow_cache(light, p_shadow_atlas);
 				}
 
 				real_t radius = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_RANGE);
@@ -2529,6 +2605,10 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 
 					RendererSceneRender::RenderShadowData &shadow_data = render_shadow_data[max_shadows_used++];
 
+					if (use_static_cache) {
+						_light_instance_extract_static_shadow_casters(instance_shadow_cull_result, shadow_data, update_static_cache, static_caster_mask);
+					}
+
 					if (!light->is_shadow_update_full()) {
 						light_culler->cull_regular_light(instance_shadow_cull_result);
 					}
@@ -2568,6 +2648,9 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 			if (max_shadows_used + 1 > MAX_UPDATE_SHADOWS) {
 				return true;
 			}
+			if (use_static_cache) {
+				update_static_cache = _light_instance_schedule_static_shadow_cache(light, p_shadow_atlas);
+			}
 
 			real_t radius = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_RANGE);
 			real_t angle = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SPOT_ANGLE);
@@ -2597,6 +2680,10 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 			p_scenario->indexers[Scenario::INDEXER_GEOMETRY].convex_query(planes.ptr(), planes.size(), points.ptr(), points.size(), cull_convex);
 
 			RendererSceneRender::RenderShadowData &shadow_data = render_shadow_data[max_shadows_used++];
+
+			if (use_static_cache) {
+				_light_instance_extract_static_shadow_casters(instance_shadow_cull_result, shadow_data, update_static_cache, static_caster_mask);
+			}
 
 			if (!light->is_shadow_update_full()) {
 				light_culler->cull_regular_light(instance_shadow_cull_result);
@@ -3512,6 +3599,16 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			}
 		}
 
+		// Positional shadow static cache: the atlas must be ready for it before any of its lights are updated.
+		if (p_shadow_atlas.is_valid()) {
+			for (uint32_t i = 0; i < (uint32_t)scene_cull_result.lights.size(); i++) {
+				if (RSG::light_storage->light_get_shadow_caching(scene_cull_result.lights[i]->base)) {
+					RSG::light_storage->shadow_atlas_enable_static_cache(p_shadow_atlas);
+					break;
+				}
+			}
+		}
+
 		// Positional Shadows
 		for (uint32_t i = 0; i < (uint32_t)scene_cull_result.lights.size(); i++) {
 			Instance *ins = scene_cull_result.lights[i];
@@ -3631,6 +3728,18 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 				// Returns false if the entire light can be culled.
 				bool allow_redraw = light_culler->prepare_regular_light(*ins);
 
+				// Positional shadow static cache: when only dynamic casters changed, update the shadow at most once every
+				// `shadow_dynamic_update_interval` frames (staggered between lights). Other changes update it right away.
+				// The shadow stays dirty until then, so the last change is never lost.
+				const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
+				if (allow_redraw && RSG::light_storage->light_get_shadow_caching(ins->base) && !light->is_static_shadow_dirty()) {
+					const uint64_t interval = RSG::light_storage->light_get_shadow_dynamic_update_interval(ins->base);
+					// The frame slot alone isn't enough: a viewport that isn't drawn on every frame could keep missing it.
+					if (interval > 1 && (frame + ins->self.get_id()) % interval != 0 && frame - light->last_shadow_update_frame < interval) {
+						allow_redraw = false;
+					}
+				}
+
 				// Directional lights aren't handled here, _light_instance_update_shadow is called from elsewhere.
 				// Checking for this in case this changes, as this is assumed.
 				DEV_CHECK_ONCE(RSG::light_storage->light_get_type(ins->base) != RSE::LIGHT_DIRECTIONAL);
@@ -3644,6 +3753,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 				if (allow_redraw) {
 					light->last_version++;
 					light->decrement_shadow_dirty();
+					light->last_shadow_update_frame = frame;
 				}
 			}
 
@@ -3722,8 +3832,38 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		prev_camera_data = RSG::viewport->viewport_get_prev_camera_data(p_viewport);
 	}
 
+	// Rays leave the view frustum, so ray traced effects get every mesh instance around the camera.
+	ray_tracing_instances.clear();
+	const PagedArray<RenderGeometryInstance *> *ray_tracing = nullptr;
+	if (p_reflection_probe.is_null() && scene_render->is_ray_tracing_needed(p_environment)) {
+		RENDER_TIMESTAMP("Cull Ray Tracing Instances");
+		const real_t distance = MAX(real_t(GLOBAL_GET_CACHED(real_t, "rendering/ray_tracing/max_distance")), real_t(0.01));
+		const AABB aabb(camera_position - Vector3(distance, distance, distance), Vector3(distance, distance, distance) * 2.0);
+
+		struct CullRayTracing {
+			PagedArray<RenderGeometryInstance *> *instances = nullptr;
+			uint32_t layers = 0;
+			_FORCE_INLINE_ bool operator()(void *p_data) {
+				const Instance *instance = static_cast<const Instance *>(p_data);
+				if (instance->visible && instance->base_type == RSE::INSTANCE_MESH && (instance->layer_mask & layers) && instance->base_data) {
+					const InstanceGeometryData *geometry = static_cast<const InstanceGeometryData *>(instance->base_data);
+					if (geometry->geometry_instance) {
+						instances->push_back(geometry->geometry_instance);
+					}
+				}
+				return false;
+			}
+		};
+
+		CullRayTracing cull_ray_tracing;
+		cull_ray_tracing.instances = &ray_tracing_instances;
+		cull_ray_tracing.layers = p_visible_layers;
+		scenario->indexers[Scenario::INDEXER_GEOMETRY].aabb_query(aabb, cull_ray_tracing);
+		ray_tracing = &ray_tracing_instances;
+	}
+
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, ray_tracing);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
@@ -3731,6 +3871,9 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 	for (uint32_t i = 0; i < max_shadows_used; i++) {
 		render_shadow_data[i].instances.clear();
+		render_shadow_data[i].static_instances.clear();
+		render_shadow_data[i].use_static_cache = false;
+		render_shadow_data[i].update_static_cache = false;
 	}
 	max_shadows_used = 0;
 
@@ -3875,6 +4018,7 @@ void RendererSceneCull::render_probes() {
 
 	SelfList<InstanceReflectionProbeData> *ref_probe = reflection_probe_render_list.first();
 	Vector<SelfList<InstanceReflectionProbeData> *> done_list;
+	LocalVector<SelfList<InstanceReflectionProbeData> *> update_always_list;
 
 	bool busy = false;
 
@@ -3901,18 +4045,38 @@ void RendererSceneCull::render_probes() {
 					busy = true; // Do not render another one of this kind.
 				} break;
 				case RSE::REFLECTION_PROBE_UPDATE_ALWAYS: {
-					int step = 0;
-					bool done = false;
-					while (!done) {
-						done = _render_reflection_probe_step(ref_probe->self()->owner, step);
-						step++;
-					}
-
+					// Rendered below, within the budget.
+					update_always_list.push_back(ref_probe);
 					done_list.push_back(ref_probe);
 				} break;
 			}
 
 			ref_probe = next;
+		}
+
+		// Each UPDATE_ALWAYS probe renders the scene 6 times and filters the result. With a
+		// budget, only the probes updated the longest ago are rendered this frame; the others
+		// keep their last reflection and are queued again by the next cull.
+		const uint32_t budget = uint32_t(MAX(0, int(GLOBAL_GET_CACHED(int, "rendering/reflections/reflection_probes/max_update_always_per_frame"))));
+		if (budget > 0 && update_always_list.size() > budget) {
+			struct OldestFirst {
+				_FORCE_INLINE_ bool operator()(const SelfList<InstanceReflectionProbeData> *p_a, const SelfList<InstanceReflectionProbeData> *p_b) const {
+					return p_a->self()->last_update_frame < p_b->self()->last_update_frame;
+				}
+			};
+			update_always_list.sort_custom<OldestFirst>();
+			update_always_list.resize(budget);
+		}
+
+		const uint64_t frame = RSG::rasterizer->get_frame_number();
+		for (SelfList<InstanceReflectionProbeData> *probe : update_always_list) {
+			int step = 0;
+			bool done = false;
+			while (!done) {
+				done = _render_reflection_probe_step(probe->self()->owner, step);
+				step++;
+			}
+			probe->self()->last_update_frame = frame;
 		}
 
 		// Now remove from our list
@@ -4339,7 +4503,7 @@ void RendererSceneCull::_update_dirty_instance(Instance *p_instance) const {
 				//ability to cast shadows change, let lights now
 				for (const Instance *E : geom->lights) {
 					InstanceLightData *light = static_cast<InstanceLightData *>(E->base_data);
-					light->make_shadow_dirty();
+					light->make_shadow_dirty_for_caster(p_instance);
 				}
 
 				geom->can_cast_shadows = can_cast_shadows;
@@ -4518,9 +4682,11 @@ RendererSceneCull::RendererSceneCull() {
 
 	instance_cull_result.set_page_pool(&instance_cull_page_pool);
 	instance_shadow_cull_result.set_page_pool(&instance_cull_page_pool);
+	ray_tracing_instances.set_page_pool(&geometry_instance_cull_page_pool);
 
 	for (uint32_t i = 0; i < MAX_UPDATE_SHADOWS; i++) {
 		render_shadow_data[i].instances.set_page_pool(&geometry_instance_cull_page_pool);
+		render_shadow_data[i].static_instances.set_page_pool(&geometry_instance_cull_page_pool);
 	}
 	for (uint32_t i = 0; i < SDFGI_MAX_CASCADES * SDFGI_MAX_REGIONS_PER_CASCADE; i++) {
 		render_sdfgi_data[i].instances.set_page_pool(&geometry_instance_cull_page_pool);
@@ -4548,10 +4714,12 @@ RendererSceneCull::RendererSceneCull() {
 
 RendererSceneCull::~RendererSceneCull() {
 	instance_cull_result.reset();
+	ray_tracing_instances.reset();
 	instance_shadow_cull_result.reset();
 
 	for (uint32_t i = 0; i < MAX_UPDATE_SHADOWS; i++) {
 		render_shadow_data[i].instances.reset();
+		render_shadow_data[i].static_instances.reset();
 	}
 	for (uint32_t i = 0; i < SDFGI_MAX_CASCADES * SDFGI_MAX_REGIONS_PER_CASCADE; i++) {
 		render_sdfgi_data[i].instances.reset();

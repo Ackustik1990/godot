@@ -57,6 +57,7 @@ public:
 	const PagedArray<RID> *decals = nullptr;
 	const PagedArray<RID> *lightmaps = nullptr;
 	const PagedArray<RID> *fog_volumes = nullptr;
+	const PagedArray<RenderGeometryInstance *> *ray_tracing_instances = nullptr; // Instances around the camera for ray traced effects, can be null.
 	RID environment;
 	RID camera_attributes;
 	RID compositor;

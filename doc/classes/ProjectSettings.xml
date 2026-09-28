@@ -3299,6 +3299,19 @@
 			[b]Note:[/b] Enabling occlusion culling has a cost on the CPU. Only enable occlusion culling if you actually plan to use it. Large open scenes with few or no objects blocking the view will generally not benefit much from occlusion culling. Large open scenes generally benefit more from mesh LOD and visibility ranges ([member GeometryInstance3D.visibility_range_begin] and [member GeometryInstance3D.visibility_range_end]) compared to occlusion culling.
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
 		</member>
+		<member name="rendering/ray_tracing/ambient_occlusion" type="bool" setter="" getter="" default="true">
+			If [code]true[/code] and [member rendering/ray_tracing/enabled] is active, screen-space ambient occlusion ([member Environment.ssao_enabled]) is replaced by ray traced ambient occlusion: short rays up to [member Environment.ssao_radius] are traced from every pixel against the scene, so occluders outside the screen or hidden behind other objects are taken into account, without the halos of screen-space ambient occlusion. The result is accumulated over frames and filtered. [member Environment.ssao_intensity] and [member Environment.ssao_power] control how dark it gets; the other screen-space ambient occlusion settings don't apply. Can be changed at runtime.
+		</member>
+		<member name="rendering/ray_tracing/enabled" type="bool" setter="" getter="" default="false">
+			If [code]true[/code] and the GPU supports ray queries, static meshes get acceleration structures, so ray traced effects can trace rays against the scene. See [member rendering/ray_tracing/reflections]. This uses additional video memory: a bottom level acceleration structure per mesh surface (built the first time it's traced), and a copy of the vertex positions for meshes with compressed vertex attributes. Meshes with skeletons or blend shapes are not traced. Only supported in the Forward+ rendering method.
+			[b]Note:[/b] This setting is only read when the project starts.
+		</member>
+		<member name="rendering/ray_tracing/max_distance" type="float" setter="" getter="" default="100.0">
+			The maximum length of the rays traced by ray traced effects, in 3D units. Only mesh instances within this distance of the camera are included in the acceleration structure rebuilt each frame, so lower values are faster in large scenes.
+		</member>
+		<member name="rendering/ray_tracing/reflections" type="bool" setter="" getter="" default="true">
+			If [code]true[/code] and [member rendering/ray_tracing/enabled] is active, screen-space reflections ([member Environment.ssr_enabled]) trace reflection rays against the scene instead of marching the depth buffer. Rays find the exact first surface they hit, including thin objects and surfaces hidden from the camera. Hits the camera can see use the lit color of the previous frame, like screen-space reflections. Hits that are hidden or off screen use the [ReflectionProbe]s that contain them, and fall back to the reflection probes and sky at the reflecting surface when no probe contains them. The [Environment] settings for screen-space reflection fade and step count don't apply to ray traced hits. Can be changed at runtime.
+		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.
 		</member>
@@ -3307,6 +3320,9 @@
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_size.mobile" type="int" setter="" getter="" default="128">
 			Lower-end override for [member rendering/reflections/reflection_atlas/reflection_size] on mobile devices, due to performance concerns or driver support.
+		</member>
+		<member name="rendering/reflections/reflection_probes/max_update_always_per_frame" type="int" setter="" getter="" default="0">
+			The maximum number of visible [ReflectionProbe]s with [constant ReflectionProbe.UPDATE_ALWAYS] that are updated each frame. Each update renders the scene six times, so many real-time probes quickly become the most expensive part of a frame. When more probes are visible, the ones updated the longest ago are updated first, and the others keep their last reflection until their turn comes. For example, with 8 visible real-time probes and a value of [code]2[/code], each probe is updated every 4 frames, at a quarter of the cost. If [code]0[/code], every visible real-time probe is updated every frame. Can be changed at runtime.
 		</member>
 		<member name="rendering/reflections/sky_reflections/fast_filter_high_quality" type="bool" setter="" getter="" default="false">
 			Use a higher quality variant of the fast filtering algorithm. Significantly slower than using default quality, but results in smoother reflections. Should only be used when the scene is especially detailed.
@@ -3458,6 +3474,9 @@
 			A larger number is more efficient up to a limit, after that it will only waste RAM (maximum efficiency is achieved when there is no more than 1 pool per frame). A small number could end up with one pool per descriptor, which negatively impacts performance.
 			[b]Note:[/b] Changing this property requires a restart to take effect.
 		</member>
+		<member name="rendering/scaling_3d/custom_upscaler_class" type="String" setter="" getter="" default="&quot;&quot;">
+			The class name of the [RenderingUpscaler] used by the root viewport and new viewports when [member rendering/scaling_3d/mode] is set to [b]Custom[/b]. It can be a native class, a GDExtension class or a script class with a global class name. See [member Viewport.scaling_3d_custom_upscaler].
+		</member>
 		<member name="rendering/scaling_3d/fsr_sharpness" type="float" setter="" getter="" default="0.2">
 			Determines how sharp the upscaled image will be when using the FSR upscaling mode. Sharpness halves with every whole number. Values go from 0.0 (sharpest) to 2.0. Values above 2.0 won't make a visible difference.
 		</member>
@@ -3592,6 +3611,15 @@
 		</member>
 		<member name="rendering/viewport/transparent_background" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], enables [member Viewport.transparent_bg] on the root viewport. This allows per-pixel transparency to be effective after also enabling [member display/window/size/transparent] and [member display/window/per_pixel_transparency/allowed].
+		</member>
+		<member name="rendering/virtual_geometry/enabled" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], surfaces with virtual geometry (see [method ArrayMesh.generate_virtual_geometry]) use GPU-driven cluster level of detail and culling in the Forward+ renderer. If [code]false[/code], they are always drawn at full detail with their regular index buffer. Can be changed at runtime.
+		</member>
+		<member name="rendering/virtual_geometry/max_index_buffer_size" type="int" setter="" getter="" default="64">
+			The maximum size, in millions of indices (4 bytes each), of the index buffer that holds the triangles selected by virtual geometry for a batch of views (the camera, or all shadow maps rendered together). The buffers grow automatically up to this size; if the selected triangles don't fit, some instances are skipped for that frame.
+		</member>
+		<member name="rendering/virtual_geometry/occlusion_culling" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], clusters of virtual geometry hidden behind other geometry are culled on the GPU with a two-pass test against a hierarchical depth buffer: clusters hidden in the previous frame are skipped in the depth pre-pass, then tested again against the depth of the current frame, and the ones that became visible are drawn in a second pre-pass. This never hides visible geometry, even when the camera or objects move. It only applies to the main camera of viewports that use a depth pre-pass, without MSAA and without XR. Can be changed at runtime.
 		</member>
 		<member name="rendering/vrs/mode" type="int" setter="" getter="" default="0">
 			Set the default Variable Rate Shading (VRS) mode for the main viewport. See [member Viewport.vrs_mode] to change this at runtime, and [enum Viewport.VRSMode] for possible values.

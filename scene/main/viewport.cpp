@@ -37,8 +37,10 @@ STATIC_ASSERT_INCOMPLETE_TYPE(class, RenderingServer);
 #include "core/config/project_settings.h"
 #include "core/debugger/engine_debugger.h"
 #include "core/input/input.h"
+#include "core/io/resource_loader.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
+#include "core/object/script_language.h"
 #include "core/templates/pair.h"
 #include "core/templates/sort_array.h"
 #include "scene/audio/audio_stream_player.h"
@@ -5109,6 +5111,25 @@ Viewport::Scaling3DMode Viewport::get_scaling_3d_mode() const {
 	return scaling_3d_mode;
 }
 
+void Viewport::set_scaling_3d_custom_upscaler(const Ref<RenderingUpscaler> &p_upscaler) {
+	ERR_MAIN_THREAD_GUARD;
+	if (scaling_3d_custom_upscaler == p_upscaler) {
+		return;
+	}
+	scaling_3d_custom_upscaler = p_upscaler;
+	RS::get_singleton()->viewport_set_scaling_3d_custom_upscaler(viewport, p_upscaler);
+}
+
+void Viewport::reset_temporal_history() {
+	ERR_MAIN_THREAD_GUARD;
+	RS::get_singleton()->viewport_reset_temporal_history(viewport);
+}
+
+Ref<RenderingUpscaler> Viewport::get_scaling_3d_custom_upscaler() const {
+	ERR_READ_THREAD_GUARD_V(Ref<RenderingUpscaler>());
+	return scaling_3d_custom_upscaler;
+}
+
 void Viewport::set_scaling_3d_scale(float p_scaling_3d_scale) {
 	ERR_MAIN_THREAD_GUARD;
 	// Clamp to reasonable values that are actually useful.
@@ -5372,6 +5393,10 @@ void Viewport::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_scaling_3d_mode", "scaling_3d_mode"), &Viewport::set_scaling_3d_mode);
 	ClassDB::bind_method(D_METHOD("get_scaling_3d_mode"), &Viewport::get_scaling_3d_mode);
 
+	ClassDB::bind_method(D_METHOD("set_scaling_3d_custom_upscaler", "upscaler"), &Viewport::set_scaling_3d_custom_upscaler);
+	ClassDB::bind_method(D_METHOD("reset_temporal_history"), &Viewport::reset_temporal_history);
+	ClassDB::bind_method(D_METHOD("get_scaling_3d_custom_upscaler"), &Viewport::get_scaling_3d_custom_upscaler);
+
 	ClassDB::bind_method(D_METHOD("set_scaling_3d_scale", "scale"), &Viewport::set_scaling_3d_scale);
 	ClassDB::bind_method(D_METHOD("get_scaling_3d_scale"), &Viewport::get_scaling_3d_scale);
 
@@ -5418,7 +5443,8 @@ void Viewport::_bind_methods() {
 
 #ifndef _3D_DISABLED
 	ADD_GROUP("Scaling 3D", "");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4"), "set_scaling_3d_mode", "get_scaling_3d_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4,Custom (RenderingUpscaler):6"), "set_scaling_3d_mode", "get_scaling_3d_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "scaling_3d_custom_upscaler", PROPERTY_HINT_RESOURCE_TYPE, RenderingUpscaler::get_class_static()), "set_scaling_3d_custom_upscaler", "get_scaling_3d_custom_upscaler");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "scaling_3d_scale", PROPERTY_HINT_RANGE, "0.1,2.0,0.0001"), "set_scaling_3d_scale", "get_scaling_3d_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "texture_mipmap_bias", PROPERTY_HINT_RANGE, "-2,2,0.001"), "set_texture_mipmap_bias", "get_texture_mipmap_bias");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16x (Slow)")), "set_anisotropic_filtering_level", "get_anisotropic_filtering_level");
@@ -5484,6 +5510,7 @@ void Viewport::_bind_methods() {
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_METALFX_SPATIAL);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_METALFX_TEMPORAL);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_NEAREST);
+	BIND_ENUM_CONSTANT(SCALING_3D_MODE_CUSTOM);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_MAX);
 
 	BIND_ENUM_CONSTANT(MSAA_DISABLED);
@@ -5627,6 +5654,27 @@ Viewport::Viewport() {
 
 #ifndef _3D_DISABLED
 	set_scaling_3d_mode((Viewport::Scaling3DMode)(int)GLOBAL_GET("rendering/scaling_3d/mode"));
+	if (scaling_3d_mode == SCALING_3D_MODE_CUSTOM) {
+		// The project-wide custom upscaler is identified by class name (native, GDExtension or global script class).
+		const StringName upscaler_class = GLOBAL_GET("rendering/scaling_3d/custom_upscaler_class");
+		if (upscaler_class != StringName()) {
+			Ref<RenderingUpscaler> upscaler;
+			if (ClassDB::class_exists(upscaler_class) && ClassDB::is_parent_class(upscaler_class, RenderingUpscaler::get_class_static()) && ClassDB::can_instantiate(upscaler_class)) {
+				upscaler = Ref<RenderingUpscaler>(Object::cast_to<RenderingUpscaler>(ClassDB::instantiate(upscaler_class)));
+			} else if (ScriptServer::is_global_class(upscaler_class)) {
+				Ref<Script> script = ResourceLoader::load(ScriptServer::get_global_class_path(upscaler_class));
+				if (script.is_valid() && script->can_instantiate()) {
+					upscaler.instantiate();
+					upscaler->set_script(script);
+				}
+			}
+			if (upscaler.is_valid()) {
+				set_scaling_3d_custom_upscaler(upscaler);
+			} else {
+				WARN_PRINT(vformat("Can't instantiate the custom upscaler class '%s' set in the rendering/scaling_3d/custom_upscaler_class project setting.", upscaler_class));
+			}
+		}
+	}
 	set_scaling_3d_scale(GLOBAL_GET("rendering/scaling_3d/scale"));
 	set_fsr_sharpness((float)GLOBAL_GET("rendering/scaling_3d/fsr_sharpness"));
 	set_texture_mipmap_bias((float)GLOBAL_GET("rendering/textures/default_filters/texture_mipmap_bias"));

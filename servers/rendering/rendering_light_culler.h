@@ -168,6 +168,7 @@ private:
 		void add_cull_plane(const Plane &p);
 		Plane cull_planes[MAX_CULL_PLANES];
 		int num_cull_planes = 0;
+		FrustumCullSIMD simd; // SIMD copy of the planes, used for directional light cascades.
 #ifdef LIGHT_CULLER_DEBUG_DIRECTIONAL_LIGHT
 		uint32_t rejected_count = 0;
 #endif

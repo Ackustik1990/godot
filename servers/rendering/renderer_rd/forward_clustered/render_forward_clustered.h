@@ -32,11 +32,13 @@
 
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
+#include "servers/rendering/render_list_radix_sort.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
+#include "servers/rendering/renderer_rd/effects/virtual_geometry.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
@@ -47,6 +49,16 @@
 #endif
 
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
+
+// Software prefetch for pointer chasing loops over render lists.
+#if defined(__GNUC__) || defined(__clang__)
+#define RENDER_PREFETCH(m_ptr) __builtin_prefetch((const void *)(m_ptr))
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#define RENDER_PREFETCH(m_ptr) _mm_prefetch((const char *)(m_ptr), _MM_HINT_T0)
+#else
+#define RENDER_PREFETCH(m_ptr) ((void)(m_ptr))
+#endif
 
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
@@ -123,6 +135,12 @@ public:
 		};
 
 		RID render_sdfgi_uniform_set;
+
+		// Virtual geometry occlusion culling: HZB of the last frame and its world to clip matrix.
+		RID vg_hzb_buffer;
+		uint32_t vg_hzb_buffer_size = 0;
+		Projection vg_hzb_matrix;
+		bool vg_hzb_valid = false;
 
 		void ensure_specular();
 		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR); }
@@ -239,6 +257,15 @@ private:
 		bool use_directional_soft_shadow = false;
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
 		bool use_material_feedback = false;
+
+		// Virtual geometry: per element draw index into the command buffers (VirtualGeometry::INVALID_DRAW for regular draws).
+		const uint32_t *vg_draws = nullptr;
+		RID vg_command_buffer;
+		RID vg_index_array;
+		// Clusters that became visible after the depth pre-pass (occlusion culling), drawn with a second
+		// indirect draw from the same index array.
+		RID vg_disoccluded_command_buffer;
+		bool vg_disoccluded_only = false; // Only draw the disoccluded clusters, skip everything else.
 
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}, bool p_use_material_feedback = false) {
 			elements = p_elements;
@@ -452,6 +479,13 @@ private:
 			bool flip_cull;
 
 			uint32_t uniform_buffer_index;
+
+			// Virtual geometry culling view for this pass.
+			RendererRD::VirtualGeometry::ViewParams vg_view;
+			bool vg_reverse_cull_face;
+
+			// If valid, this is not a render pass: `rect` is copied from this depth texture to `framebuffer`.
+			RID copy_depth_from;
 		};
 
 		LocalVector<ShadowPass> shadow_passes;
@@ -519,6 +553,7 @@ private:
 			FLAG_USES_PARTICLE_TRAILS = 65536,
 			FLAG_USES_MOTION_VECTOR = 131072,
 			FLAG_USES_STENCIL = 262144,
+			FLAG_USES_VIRTUAL_GEOMETRY = 524288,
 		};
 
 		union {
@@ -563,6 +598,15 @@ private:
 		void *surface_shadow = nullptr;
 		RID material_uniform_set_shadow;
 		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
+
+		// Virtual geometry job of the current main view batch, shared by the depth, opaque and motion passes.
+		uint64_t vg_batch_id = 0;
+		uint32_t vg_draw = 0;
+
+		// Copied from the mesh surface when the cache is built, so filling the instance
+		// buffer doesn't have to touch the mesh storage for every element.
+		AABB compressed_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
+		Vector4 compressed_uv_scale;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
 		GeometryInstanceForwardClustered *owner = nullptr;
@@ -702,13 +746,14 @@ private:
 	struct RenderList {
 		LocalVector<GeometryInstanceSurfaceDataCache *> elements;
 		LocalVector<RenderElementInfo> element_info;
+		LocalVector<uint32_t> vg_draws; // Virtual geometry draw per element, only filled when used.
+		RenderListRadixSorter radix_sorter;
 
 		void clear() {
 			elements.clear();
 			element_info.clear();
+			vg_draws.clear();
 		}
-
-		//should eventually be replaced by radix
 
 		struct SortByKey {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
@@ -717,13 +762,17 @@ private:
 		};
 
 		void sort_by_key() {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr(), elements.size());
+			sort_by_key_range(0, elements.size());
 		}
 
 		void sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr() + p_from, p_size);
+			if (p_size >= RENDER_LIST_RADIX_SORT_THRESHOLD) {
+				// Large lists: stable radix sort, about 3x faster than introsort at 10k elements.
+				radix_sorter.sort(elements.ptr() + p_from, p_size);
+			} else {
+				SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
+				sorter.sort(elements.ptr() + p_from, p_size);
+			}
 		}
 
 		struct SortByDepth {
@@ -770,6 +819,29 @@ private:
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
+	/* Virtual geometry */
+
+	RendererRD::VirtualGeometry *virtual_geometry = nullptr;
+	bool virtual_geometry_active = false;
+	uint64_t virtual_geometry_batch_id = 0;
+	RID virtual_geometry_main_commands;
+	RID virtual_geometry_main_indices;
+	RID virtual_geometry_disoccluded_commands;
+	bool virtual_geometry_occlusion_pending = false; // The main batch waits for the HZB of this frame.
+	RID virtual_geometry_shadow_commands;
+	RID virtual_geometry_shadow_indices;
+
+	_FORCE_INLINE_ bool _virtual_geometry_is_eligible(const GeometryInstanceSurfaceDataCache *p_surface) const;
+	uint32_t _virtual_geometry_get_job_flags(const GeometryInstanceSurfaceDataCache *p_surface, bool p_shadow, bool p_reverse_cull_face) const;
+	void _virtual_geometry_setup_main(const RenderDataRD *p_render_data, bool p_occlusion_culling);
+	void _virtual_geometry_process_occlusion(const RenderDataRD *p_render_data);
+	void _virtual_geometry_setup_shadows();
+	void _virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array, RID p_disoccluded_command_buffer = RID());
+
+public:
+	virtual bool is_ray_tracing_needed(RID p_environment) const override;
+
+private:
 	/* Cluster builder */
 
 	ClusterBuilderSharedDataRD cluster_builder_shared;
@@ -785,8 +857,9 @@ private:
 
 	/* Render shadows */
 
-	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
+	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D(), const RenderShadowData *p_shadow_data = nullptr);
 	void _render_shadow_begin();
+	void _render_shadow_append_depth_copy(RID p_source_depth, RID p_framebuffer, const Rect2i &p_rect);
 	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
 	void _render_shadow_process();
 	void _render_shadow_end();
@@ -794,11 +867,30 @@ private:
 	/* Render Scene */
 	void _process_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections);
 	void _process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform);
-	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform);
+	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform, RID p_tlas = RID(), RID p_reflection_atlas = RID());
+
+	/* Ray tracing */
+
+	RID ray_tracing_tlas;
+	uint32_t ray_tracing_tlas_capacity = 0;
+	LocalVector<RD::AccelerationStructureInstance> ray_tracing_tlas_instances;
+
+	// Builds the top level acceleration structure of the ray tracing instances of the render,
+	// relative to the camera. Returns an invalid RID when there is nothing to trace.
+	RID _ray_tracing_update_tlas(const RenderDataRD *p_render_data);
+	bool _is_ray_traced_ssr_used(RID p_environment) const;
+	bool _is_ray_traced_ao_used(RID p_environment) const;
+	void _process_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform, RID p_tlas);
 	void _process_sscs(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection *p_projections, const Transform3D &p_transform, const LocalVector<int> &p_contact_shadows, const RenderShadowData *p_render_shadows, float p_taa_frame_count);
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_sscs, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
+
+	/* Custom (e.g. neural network) upscalers */
+	LocalVector<void *> native_upscale_calls;
+	uint64_t native_upscale_frame = 0;
+	void _process_custom_upscaler(RenderDataRD *p_render_data, bool p_reset);
+	void _free_native_upscale_calls();
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

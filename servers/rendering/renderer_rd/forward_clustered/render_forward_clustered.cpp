@@ -131,6 +131,13 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		cluster_builder = nullptr;
 	}
 
+	if (vg_hzb_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(vg_hzb_buffer);
+		vg_hzb_buffer = RID();
+	}
+	vg_hzb_buffer_size = 0;
+	vg_hzb_valid = false;
+
 	if (fsr2_context) {
 		memdelete(fsr2_context);
 		fsr2_context = nullptr;
@@ -392,6 +399,18 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			mesh_surface = surf->surface;
 		}
 
+		uint32_t vg_draw = RendererRD::VirtualGeometry::INVALID_DRAW;
+		if (p_params->vg_draws) {
+			vg_draw = p_params->vg_draws[i];
+			if (vg_draw != RendererRD::VirtualGeometry::INVALID_DRAW) {
+				// Clusters index the vertex buffer of the main surface, even in passes that would use the shadow mesh.
+				mesh_surface = surf->surface;
+			}
+		}
+		if (p_params->vg_disoccluded_only && vg_draw == RendererRD::VirtualGeometry::INVALID_DRAW) {
+			continue; // Already drawn by the first pass.
+		}
+
 		if (!mesh_surface) {
 			continue;
 		}
@@ -548,7 +567,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		}
 
 		if (pipeline_valid) {
-			if (!emulate_point_size) {
+			if (vg_draw != RendererRD::VirtualGeometry::INVALID_DRAW) {
+				index_array_rd = p_params->vg_index_array; // Shared by the main and disoccluded draws.
+			} else if (!emulate_point_size) {
 				index_array_rd = mesh_storage->mesh_surface_get_index_array(mesh_surface, element_info.lod_index);
 			} else {
 				index_array_rd = RID();
@@ -612,7 +633,16 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
 
-			if (emulate_point_size) {
+			if (vg_draw != RendererRD::VirtualGeometry::INVALID_DRAW) {
+				// Triangles selected and compacted on the GPU by the virtual geometry cull passes.
+				const uint32_t command_offset = vg_draw * RendererRD::VirtualGeometry::COMMAND_STRIDE_BYTES;
+				if (!p_params->vg_disoccluded_only) {
+					RD::get_singleton()->draw_list_draw_indirect(draw_list, true, p_params->vg_command_buffer, command_offset, 1, 0);
+				}
+				if (p_params->vg_disoccluded_command_buffer.is_valid()) {
+					RD::get_singleton()->draw_list_draw_indirect(draw_list, true, p_params->vg_disoccluded_command_buffer, command_offset, 1, 0);
+				}
+			} else if (emulate_point_size) {
 				if (indirect) {
 					WARN_PRINT("Indirect draws are not supported when emulating point size.");
 				}
@@ -837,6 +867,16 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 	uint32_t repeats = 0;
 	GeometryInstanceSurfaceDataCache *prev_surface = nullptr;
 	for (uint32_t i = 0; i < element_total; i++) {
+		// Elements are sorted by material, so their surfaces and instances are scattered in
+		// memory and this loop is bound by cache misses. Prefetch a few iterations ahead:
+		// first the surface cache, then (once it's likely resident) its owner instance.
+		if (i + 8 < element_total) {
+			RENDER_PREFETCH(rl->elements[i + 8 + p_offset]);
+		}
+		if (i + 4 < element_total) {
+			RENDER_PREFETCH(rl->elements[i + 4 + p_offset]->owner);
+		}
+
 		GeometryInstanceSurfaceDataCache *surface = rl->elements[i + p_offset];
 		GeometryInstanceForwardClustered *inst = surface->owner;
 
@@ -871,14 +911,9 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 		instance_data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 		instance_data.set_lightmap_uv_scale(inst->lightmap_uv_scale);
 
-		AABB surface_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
-		uint64_t format = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(surface->surface);
-		Vector4 uv_scale = Vector4(0.0, 0.0, 0.0, 0.0);
-
-		if (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
-			surface_aabb = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_aabb(surface->surface);
-			uv_scale = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_uv_scale(surface->surface);
-		}
+		// Identity AABB and zero UV scale unless the surface uses compressed attributes.
+		const AABB &surface_aabb = surface->compressed_aabb;
+		const Vector4 &uv_scale = surface->compressed_uv_scale;
 
 		uint32_t material_feedback_index = UINT32_MAX;
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
@@ -893,7 +928,8 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 
 		scene_state.curr_gpu_ptr[p_render_list][i + p_offset] = instance_data;
 
-		const bool cant_repeat = instance_data.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
+		// Virtual geometry surfaces get their own triangles per instance, so they can't be batched with instancing.
+		const bool cant_repeat = instance_data.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid() || (virtual_geometry_active && (surface->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_VIRTUAL_GEOMETRY));
 
 		if (prev_surface != nullptr && !cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && prev_surface->uses_lightmap_specular == surface->uses_lightmap_specular && inst->mirror == prev_surface->owner->mirror && repeats < RenderElementInfo::MAX_REPEATS) {
 			//this element is the same as the previous one, count repeats to draw it using instancing
@@ -970,7 +1006,16 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	//fill list
 
-	for (int i = 0; i < (int)p_render_data->instances->size(); i++) {
+	const int instance_count = (int)p_render_data->instances->size();
+	for (int i = 0; i < instance_count; i++) {
+		// Hide the latency of the pointer chasing below, see _fill_instance_data().
+		if (i + 8 < instance_count) {
+			RENDER_PREFETCH((*p_render_data->instances)[i + 8]);
+		}
+		if (i + 4 < instance_count) {
+			RENDER_PREFETCH(static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i + 4])->surface_caches);
+		}
+
 		GeometryInstanceForwardClustered *inst = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
 
 		Vector3 center = inst->transform.origin;
@@ -1473,6 +1518,24 @@ void RenderForwardClustered::_process_ssao(Ref<RenderSceneBuffersRD> p_render_bu
 	}
 }
 
+void RenderForwardClustered::_process_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform, RID p_tlas) {
+	RENDER_TIMESTAMP("Process Ray Traced AO");
+
+	Ref<RenderBufferDataForwardClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	ERR_FAIL_COND(rb_data.is_null());
+
+	RendererRD::SSEffects::SSAOSettings settings;
+	settings.radius = environment_get_ssao_radius(p_environment);
+	settings.intensity = environment_get_ssao_intensity(p_environment);
+	settings.power = environment_get_ssao_power(p_environment);
+	settings.full_screen_size = p_render_buffers->get_internal_size();
+
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+	for (uint32_t v = 0; v < p_render_buffers->get_view_count(); v++) {
+		ss_effects->generate_ray_traced_ao(p_render_buffers, rb_data->ss_effects_data.ssao, v, p_normal_buffers[v], p_projections[v], p_transform, settings, p_tlas, frame);
+	}
+}
+
 void RenderForwardClustered::_process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform) {
 	ERR_FAIL_NULL(ss_effects);
 	ERR_FAIL_COND(p_render_buffers.is_null());
@@ -1508,7 +1571,71 @@ void RenderForwardClustered::_process_ssil(Ref<RenderSceneBuffersRD> p_render_bu
 	rb_data->ss_effects_data.ssil_last_frame_transform = transform;
 }
 
-void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform) {
+bool RenderForwardClustered::_is_ray_traced_ssr_used(RID p_environment) const {
+	return ss_effects && ss_effects->is_ray_traced_ssr_available() && GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/reflections") && p_environment.is_valid() && environment_get_ssr_enabled(p_environment);
+}
+
+bool RenderForwardClustered::_is_ray_traced_ao_used(RID p_environment) const {
+	return ss_effects && ss_effects->is_ray_traced_ao_available() && GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/ambient_occlusion") && p_environment.is_valid() && environment_get_ssao_enabled(p_environment);
+}
+
+bool RenderForwardClustered::is_ray_tracing_needed(RID p_environment) const {
+	return _is_ray_traced_ssr_used(p_environment) || _is_ray_traced_ao_used(p_environment);
+}
+
+RID RenderForwardClustered::_ray_tracing_update_tlas(const RenderDataRD *p_render_data) {
+	if (!p_render_data->ray_tracing_instances) {
+		return RID();
+	}
+
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	// Rays are traced in view space, which also keeps precision high around the camera.
+	const Transform3D world_to_view = p_render_data->scene_data->cam_transform.affine_inverse();
+	const PagedArray<RenderGeometryInstance *> &instances = *p_render_data->ray_tracing_instances;
+
+	ray_tracing_tlas_instances.clear();
+	for (uint32_t i = 0; i < instances.size(); i++) {
+		const GeometryInstanceForwardClustered *ginstance = static_cast<const GeometryInstanceForwardClustered *>(instances[i]);
+		const Transform3D transform = world_to_view * (ginstance->store_transform_cache ? ginstance->transform : Transform3D());
+		for (const GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches; surf; surf = surf->next) {
+			// Only opaque surfaces: hits are validated against the depth buffer, which transparent ones don't write.
+			if (!(surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
+				continue;
+			}
+			const RID blas = mesh_storage->mesh_surface_get_blas(surf->surface);
+			if (blas.is_null()) {
+				continue;
+			}
+			RD::AccelerationStructureInstance instance;
+			instance.transform = transform;
+			instance.blas = blas;
+			instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+			ray_tracing_tlas_instances.push_back(instance);
+		}
+	}
+
+	if (ray_tracing_tlas_instances.is_empty()) {
+		return RID();
+	}
+
+	if (ray_tracing_tlas.is_null() || ray_tracing_tlas_capacity < ray_tracing_tlas_instances.size()) {
+		if (ray_tracing_tlas.is_valid()) {
+			RD::get_singleton()->free_rid(ray_tracing_tlas);
+		}
+		ray_tracing_tlas_capacity = Math::next_power_of_2(MAX(ray_tracing_tlas_instances.size(), 64u));
+		// Rebuilt every frame, since instances are relative to the camera.
+		ray_tracing_tlas = RD::get_singleton()->tlas_create(ray_tracing_tlas_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+		ERR_FAIL_COND_V(ray_tracing_tlas.is_null(), RID());
+	}
+
+	RD::get_singleton()->draw_command_begin_label("Ray Tracing TLAS");
+	const Error err = RD::get_singleton()->tlas_build(ray_tracing_tlas, Span<RD::AccelerationStructureInstance>(ray_tracing_tlas_instances.ptr(), ray_tracing_tlas_instances.size()));
+	RD::get_singleton()->draw_command_end_label();
+	ERR_FAIL_COND_V(err != OK, RID());
+	return ray_tracing_tlas;
+}
+
+void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform, RID p_tlas, RID p_reflection_atlas) {
 	ERR_FAIL_NULL(ss_effects);
 	ERR_FAIL_COND(p_render_buffers.is_null());
 
@@ -1533,7 +1660,17 @@ void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 	rb_data->ss_effects_data.ssr_last_frame_transform = p_transform;
 
-	ss_effects->screen_space_reflection(p_render_buffers, rb_data->ss_effects_data.ssr, p_normal_slices, environment_get_ssr_max_steps(p_environment), environment_get_ssr_fade_in(p_environment), environment_get_ssr_fade_out(p_environment), environment_get_ssr_depth_tolerance(p_environment), p_projections, reprojections, p_eye_offsets, *copy_effects);
+	RendererRD::RayTracedReflectionProbes probes;
+	if (p_tlas.is_valid() && p_reflection_atlas.is_valid()) {
+		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+		probes.buffer = light_storage->get_reflection_probe_buffer();
+		probes.count = light_storage->get_reflection_probe_count();
+		probes.atlas = light_storage->reflection_atlas_get_texture(p_reflection_atlas);
+		const float border_size = light_storage->reflection_atlas_get_border_size(p_reflection_atlas);
+		probes.atlas_border_size = Size2(border_size, 1.0f - border_size * 2.0f);
+	}
+
+	ss_effects->screen_space_reflection(p_render_buffers, rb_data->ss_effects_data.ssr, p_normal_slices, environment_get_ssr_max_steps(p_environment), environment_get_ssr_fade_in(p_environment), environment_get_ssr_fade_out(p_environment), environment_get_ssr_depth_tolerance(p_environment), p_projections, reprojections, p_eye_offsets, *copy_effects, p_tlas, GLOBAL_GET_CACHED(float, "rendering/ray_tracing/max_distance"), probes);
 }
 
 void RenderForwardClustered::_process_sscs(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection *p_projections, const Transform3D &p_transform, const LocalVector<int> &p_contact_shadows, const RenderShadowData *p_render_shadows, const float p_taa_frame_count) {
@@ -1637,7 +1774,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 			RENDER_TIMESTAMP("Render OmniLight Shadows");
 			// Cube shadows are rendered in their own way.
 			for (const int &index : p_render_data->cube_shadows) {
-				_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, p_render_data->render_shadows[index].pass, p_render_data->render_shadows[index].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
+				_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, p_render_data->render_shadows[index].pass, p_render_data->render_shadows[index].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform, &p_render_data->render_shadows[index]);
 			}
 		}
 
@@ -1672,7 +1809,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		}
 		//render positional shadows
 		for (uint32_t i = 0; i < p_render_data->shadows.size(); i++) {
-			_render_shadow_pass(p_render_data->render_shadows[p_render_data->shadows[i]].light, p_render_data->shadow_atlas, p_render_data->render_shadows[p_render_data->shadows[i]].pass, p_render_data->render_shadows[p_render_data->shadows[i]].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, i == 0, i == p_render_data->shadows.size() - 1, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
+			_render_shadow_pass(p_render_data->render_shadows[p_render_data->shadows[i]].light, p_render_data->shadow_atlas, p_render_data->render_shadows[p_render_data->shadows[i]].pass, p_render_data->render_shadows[p_render_data->shadows[i]].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, i == 0, i == p_render_data->shadows.size() - 1, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform, &p_render_data->render_shadows[p_render_data->shadows[i]]);
 		}
 
 		_render_shadow_process();
@@ -1685,6 +1822,11 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	if (render_shadows) {
 		_render_shadow_end();
 	}
+
+	// Ray traced effects share one acceleration structure per render, built before the first of them.
+	const bool ray_traced_ao = p_use_ssao && _is_ray_traced_ao_used(p_render_data->environment);
+	const bool ray_traced_ssr = p_use_ssr && _is_ray_traced_ssr_used(p_render_data->environment);
+	const RID tlas = (rb_data.is_valid() && (ray_traced_ao || ray_traced_ssr)) ? _ray_tracing_update_tlas(p_render_data) : RID();
 
 	if (rb_data.is_valid() && ss_effects) {
 		// Note, in multiview we're allocating buffers for each eye/view we're rendering.
@@ -1703,7 +1845,11 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 			}
 
 			if (p_use_ssao) {
-				_process_ssao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection);
+				if (ray_traced_ao && tlas.is_valid()) {
+					_process_ray_traced_ao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, tlas);
+				} else {
+					_process_ssao(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection);
+				}
 			}
 
 			if (p_use_ssil) {
@@ -1713,10 +1859,6 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 		if (p_use_sscs) {
 			_process_sscs(rb, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, p_render_data->contact_shadows, p_render_data->render_shadows, p_render_data->scene_data->taa_frame_count);
-		}
-
-		if (p_use_ssr) {
-			_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform);
 		}
 	}
 
@@ -1753,6 +1895,12 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		current_cluster_builder->bake_cluster();
 	}
 
+	if (rb_data.is_valid() && ss_effects && p_use_ssr) {
+		// After the reflection probe buffer update: ray traced reflections shade the hits that
+		// aren't on screen with the probes of this frame.
+		_process_ssr(rb, p_render_data->environment, p_normal_roughness_slices, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, ray_traced_ssr ? tlas : RID(), p_render_data->reflection_atlas);
+	}
+
 	if (rb_data.is_valid()) {
 		RENDER_TIMESTAMP("Update Volumetric Fog");
 		bool directional_shadows = RendererRD::LightStorage::get_singleton()->has_directional_shadows(directional_light_count);
@@ -1780,8 +1928,245 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
+/* Virtual geometry */
+
+bool RenderForwardClustered::_virtual_geometry_is_eligible(const GeometryInstanceSurfaceDataCache *p_surface) const {
+	if (!(p_surface->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_VIRTUAL_GEOMETRY)) {
+		return false;
+	}
+	const GeometryInstanceForwardClustered *owner = p_surface->owner;
+	// Deformed or instanced geometry can't be culled with the static cluster bounds.
+	return owner->instance_count == 1 && owner->mesh_instance.is_null() && !(owner->base_flags & (INSTANCE_DATA_FLAG_MULTIMESH | INSTANCE_DATA_FLAG_PARTICLES));
+}
+
+uint32_t RenderForwardClustered::_virtual_geometry_get_job_flags(const GeometryInstanceSurfaceDataCache *p_surface, bool p_shadow, bool p_reverse_cull_face) const {
+	// Normal cone culling must reject exactly the faces the pipeline would cull. Culling
+	// is evaluated in the "unmirrored" space of each instance, so the mirroring and the
+	// pass-level winding compensations applied by _render_list_template() don't matter,
+	// only the material cull mode and an explicit face reversal do.
+	RD::PolygonCullMode cull_mode;
+	if (p_shadow) {
+		if (p_surface->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS) {
+			return 0;
+		}
+		cull_mode = p_surface->shader_shadow->get_cull_mode_from_cull_variant(SceneShaderForwardClustered::ShaderData::CULL_VARIANT_NORMAL);
+	} else {
+		// The main view job is shared by the depth pre-pass (shadow material) and the color passes.
+		cull_mode = p_surface->shader->get_cull_mode_from_cull_variant(SceneShaderForwardClustered::ShaderData::CULL_VARIANT_NORMAL);
+		if (cull_mode != p_surface->shader_shadow->get_cull_mode_from_cull_variant(SceneShaderForwardClustered::ShaderData::CULL_VARIANT_NORMAL)) {
+			return 0;
+		}
+	}
+
+	uint32_t flags = 0;
+	if (cull_mode == RD::POLYGON_CULL_BACK) {
+		flags = RendererRD::VirtualGeometry::JOB_FLAG_CONE_CULL;
+	} else if (cull_mode == RD::POLYGON_CULL_FRONT) {
+		flags = RendererRD::VirtualGeometry::JOB_FLAG_CONE_CULL | RendererRD::VirtualGeometry::JOB_FLAG_CONE_INVERT;
+	} else {
+		return 0;
+	}
+	if (p_reverse_cull_face) {
+		flags ^= RendererRD::VirtualGeometry::JOB_FLAG_CONE_INVERT;
+	}
+	return flags;
+}
+
+void RenderForwardClustered::_virtual_geometry_setup_main(const RenderDataRD *p_render_data, bool p_occlusion_culling) {
+	virtual_geometry_main_commands = RID();
+	virtual_geometry_main_indices = RID();
+	virtual_geometry_disoccluded_commands = RID();
+	virtual_geometry_occlusion_pending = false;
+	if (!virtual_geometry_active) {
+		return;
+	}
+
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const RenderSceneDataRD *scene_data = p_render_data->scene_data;
+
+	RendererRD::VirtualGeometry::ViewParams view;
+	view.projection = scene_data->cam_projection;
+	view.transform = scene_data->cam_transform;
+	view.orthogonal = scene_data->cam_orthogonal;
+	view.lod_position = scene_data->main_cam_transform.origin;
+	view.lod_orthogonal = scene_data->cam_orthogonal;
+	view.lod_distance_multiplier = scene_data->lod_distance_multiplier;
+	view.lod_threshold = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLE_LOD ? 0.0f : scene_data->screen_mesh_lod_threshold;
+
+	RID hzb_buffer;
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	Ref<RenderBufferDataForwardClustered> rb_data;
+	if (p_occlusion_culling && virtual_geometry->is_occlusion_culling_enabled() && rb.is_valid() && rb->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
+		rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+		const Size2i depth_size = rb->get_internal_size();
+		const uint32_t mip_count = RendererRD::VirtualGeometry::get_hzb_mip_count(depth_size);
+		const uint32_t hzb_size = RendererRD::VirtualGeometry::get_hzb_buffer_size(depth_size);
+		if (rb_data->vg_hzb_buffer.is_null() || rb_data->vg_hzb_buffer_size != hzb_size) {
+			if (rb_data->vg_hzb_buffer.is_valid()) {
+				RD::get_singleton()->free_rid(rb_data->vg_hzb_buffer);
+			}
+			rb_data->vg_hzb_buffer = RD::get_singleton()->storage_buffer_create(hzb_size);
+			RD::get_singleton()->set_resource_name(rb_data->vg_hzb_buffer, "VirtualGeometryHZB");
+			rb_data->vg_hzb_buffer_size = hzb_size;
+			rb_data->vg_hzb_valid = false;
+		}
+
+		Projection correction;
+		correction.set_depth_correction(scene_data->flip_y);
+		view.occlusion_culling = true;
+		view.occlusion_current = correction * scene_data->cam_projection * Projection(scene_data->cam_transform.affine_inverse());
+		view.occlusion_previous = rb_data->vg_hzb_matrix;
+		view.occlusion_previous_valid = rb_data->vg_hzb_valid;
+		view.depth_size = depth_size;
+		view.hzb_mip_count = mip_count;
+		hzb_buffer = rb_data->vg_hzb_buffer;
+	}
+
+	virtual_geometry->begin_batch();
+	virtual_geometry_batch_id++;
+	const uint32_t view_index = virtual_geometry->add_view(view);
+
+	// The motion list shares surfaces with the opaque list; they share the same job.
+	const RenderListType lists[2] = { RENDER_LIST_OPAQUE, RENDER_LIST_MOTION };
+	for (RenderListType list_type : lists) {
+		RenderList &rl = render_list[list_type];
+		rl.vg_draws.clear();
+		bool any = false;
+		for (uint32_t i = 0; i < rl.elements.size(); i++) {
+			GeometryInstanceSurfaceDataCache *surf = rl.elements[i];
+			if (!_virtual_geometry_is_eligible(surf)) {
+				continue;
+			}
+			if (surf->vg_batch_id != virtual_geometry_batch_id) {
+				const RendererRD::VirtualGeometryPool::Allocation *allocation = mesh_storage->mesh_surface_get_virtual_geometry(surf->surface);
+				if (!allocation) {
+					continue; // Not uploaded yet.
+				}
+				const GeometryInstanceForwardClustered *owner = surf->owner;
+				surf->vg_draw = virtual_geometry->add_job(view_index, owner->store_transform_cache ? owner->transform : Transform3D(), owner->non_uniform_scale, *allocation, _virtual_geometry_get_job_flags(surf, false, false));
+				surf->vg_batch_id = virtual_geometry_batch_id;
+			}
+			if (surf->vg_draw == RendererRD::VirtualGeometry::INVALID_DRAW) {
+				continue;
+			}
+			if (!any) {
+				rl.vg_draws.resize(rl.elements.size());
+				for (uint32_t &draw : rl.vg_draws) {
+					draw = RendererRD::VirtualGeometry::INVALID_DRAW;
+				}
+				any = true;
+			}
+			rl.vg_draws[i] = surf->vg_draw;
+		}
+	}
+
+	virtual_geometry->end_batch(hzb_buffer);
+	if (!render_list[RENDER_LIST_OPAQUE].vg_draws.is_empty() || !render_list[RENDER_LIST_MOTION].vg_draws.is_empty()) {
+		virtual_geometry_main_commands = virtual_geometry->get_command_buffer();
+		virtual_geometry_main_indices = virtual_geometry->get_index_array();
+		virtual_geometry_occlusion_pending = virtual_geometry->has_disoccluded_pass();
+	}
+}
+
+void RenderForwardClustered::_virtual_geometry_process_occlusion(const RenderDataRD *p_render_data) {
+	if (!virtual_geometry_occlusion_pending) {
+		return;
+	}
+	virtual_geometry_occlusion_pending = false;
+
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	Ref<RenderBufferDataForwardClustered> rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	ERR_FAIL_COND(rb_data->vg_hzb_buffer.is_null());
+
+	// Build the HZB from the depth of this frame's pre-pass, then retest the clusters the
+	// first pass rejected with the depth of the previous frame.
+	virtual_geometry->build_hzb(rb->get_depth_texture(), rb->get_internal_size(), rb_data->vg_hzb_buffer);
+	virtual_geometry->process_disoccluded(rb_data->vg_hzb_buffer);
+
+	Projection correction;
+	correction.set_depth_correction(p_render_data->scene_data->flip_y);
+	rb_data->vg_hzb_matrix = correction * p_render_data->scene_data->cam_projection * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
+	rb_data->vg_hzb_valid = true;
+
+	virtual_geometry_disoccluded_commands = virtual_geometry->get_command_buffer(RendererRD::VirtualGeometry::PASS_DISOCCLUDED);
+}
+
+void RenderForwardClustered::_virtual_geometry_setup_shadows() {
+	virtual_geometry_shadow_commands = RID();
+	virtual_geometry_shadow_indices = RID();
+	RenderList &rl = render_list[RENDER_LIST_SECONDARY];
+	rl.vg_draws.clear();
+	if (!virtual_geometry_active) {
+		return;
+	}
+
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	bool batch_started = false;
+	bool any = false;
+
+	for (const SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
+		uint32_t view_index = 0;
+		bool view_added = false;
+		for (uint32_t i = shadow_pass.element_from; i < shadow_pass.element_from + shadow_pass.element_count; i++) {
+			GeometryInstanceSurfaceDataCache *surf = rl.elements[i];
+			if (!_virtual_geometry_is_eligible(surf)) {
+				continue;
+			}
+			const RendererRD::VirtualGeometryPool::Allocation *allocation = mesh_storage->mesh_surface_get_virtual_geometry(surf->surface);
+			if (!allocation) {
+				continue;
+			}
+			if (!batch_started) {
+				virtual_geometry->begin_batch();
+				batch_started = true;
+			}
+			if (!view_added) {
+				view_index = virtual_geometry->add_view(shadow_pass.vg_view);
+				view_added = true;
+			}
+			const GeometryInstanceForwardClustered *owner = surf->owner;
+			const uint32_t draw = virtual_geometry->add_job(view_index, owner->store_transform_cache ? owner->transform : Transform3D(), owner->non_uniform_scale, *allocation, _virtual_geometry_get_job_flags(surf, true, shadow_pass.vg_reverse_cull_face));
+			if (draw == RendererRD::VirtualGeometry::INVALID_DRAW) {
+				continue;
+			}
+			if (!any) {
+				rl.vg_draws.resize(rl.elements.size());
+				for (uint32_t &value : rl.vg_draws) {
+					value = RendererRD::VirtualGeometry::INVALID_DRAW;
+				}
+				any = true;
+			}
+			rl.vg_draws[i] = draw;
+		}
+	}
+
+	if (batch_started) {
+		virtual_geometry->end_batch();
+		if (any) {
+			virtual_geometry_shadow_commands = virtual_geometry->get_command_buffer();
+			virtual_geometry_shadow_indices = virtual_geometry->get_index_array();
+		}
+	}
+}
+
+void RenderForwardClustered::_virtual_geometry_apply(RenderListParameters &p_params, RenderListType p_list, uint32_t p_offset, RID p_command_buffer, RID p_index_array, RID p_disoccluded_command_buffer) {
+	const RenderList &rl = render_list[p_list];
+	if (p_command_buffer.is_null() || p_index_array.is_null() || rl.vg_draws.is_empty()) {
+		return;
+	}
+	p_params.vg_draws = rl.vg_draws.ptr() + p_offset;
+	p_params.vg_command_buffer = p_command_buffer;
+	p_params.vg_index_array = p_index_array;
+	p_params.vg_disoccluded_command_buffer = p_disoccluded_command_buffer;
+}
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
+
+	if (virtual_geometry) {
+		virtual_geometry->update_settings();
+		virtual_geometry_active = virtual_geometry->is_enabled();
+	}
 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -1864,11 +2249,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		SCALE_NONE,
 		SCALE_FSR2,
 		SCALE_MFX,
+		SCALE_CUSTOM,
 	} scale_type = SCALE_NONE;
 
 	switch (rb->get_scaling_3d_mode()) {
 		case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
 			scale_type = SCALE_FSR2;
+			break;
+		case RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM:
+			scale_type = rb->get_custom_upscaler().is_valid() ? SCALE_CUSTOM : SCALE_NONE;
 			break;
 		case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
 #ifdef METAL_MFXTEMPORAL_ENABLED
@@ -2006,6 +2395,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
 
 	RD::get_singleton()->draw_command_end_label();
+
+	// Select and compact the clusters of virtual geometry surfaces for this camera. The result
+	// is shared by the depth pre-pass, the opaque pass and the motion pass. Occlusion culling
+	// needs the depth pre-pass to build the HZB of the current frame (see below).
+	{
+		const bool will_use_depth_prepass = !is_reflection_probe && rb_data.is_valid() && (scene_state.used_opaque_stencil || scene_shader.depth_prepass_enabled);
+		const bool occlusion_culling = will_use_depth_prepass && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED && rb->get_view_count() == 1;
+		_virtual_geometry_setup_main(p_render_data, occlusion_culling);
+	}
 
 	if (!is_reflection_probe) {
 		if (using_voxelgi) {
@@ -2224,7 +2622,19 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		bool finish_depth = using_ssao || using_ssil || using_sdfgi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
+		_virtual_geometry_apply(render_list_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices);
 		_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DrawFlags(needs_pre_resolve ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL), depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
+
+		if (virtual_geometry_occlusion_pending) {
+			// Virtual geometry occlusion culling: retest the clusters hidden in the previous frame
+			// against this depth, and add the ones that became visible to the depth buffer.
+			_virtual_geometry_process_occlusion(p_render_data);
+
+			RenderListParameters disoccluded_params = render_list_params;
+			disoccluded_params.vg_disoccluded_only = true;
+			_virtual_geometry_apply(disoccluded_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices, virtual_geometry_disoccluded_commands);
+			_render_list_with_draw_list(&disoccluded_params, depth_framebuffer, RD::DRAW_DEFAULT_ALL, depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
+		}
 
 		RD::get_singleton()->draw_command_end_label();
 
@@ -2306,6 +2716,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			uint32_t opaque_color_pass_flags = using_motion_pass ? (color_pass_flags & ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS)) : color_pass_flags;
 			RID opaque_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(opaque_color_pass_flags) : color_framebuffer;
 			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
+			if (unlikely(virtual_geometry_occlusion_pending)) {
+				ERR_PRINT_ONCE("Virtual geometry occlusion culling was set up without a depth pre-pass. This is a bug.");
+				virtual_geometry_occlusion_pending = false;
+			}
+			_virtual_geometry_apply(render_list_params, RENDER_LIST_OPAQUE, 0, virtual_geometry_main_commands, virtual_geometry_main_indices, virtual_geometry_disoccluded_commands);
 			_render_list_with_draw_list(&render_list_params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
 		}
 
@@ -2332,6 +2747,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_MOTION, p_render_data, is_multiview, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
 
 			RenderListParameters render_list_params(render_list[RENDER_LIST_MOTION].elements.ptr(), render_list[RENDER_LIST_MOTION].element_info.ptr(), render_list[RENDER_LIST_MOTION].elements.size(), reverse_cull, PASS_MODE_COLOR, color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
+			_virtual_geometry_apply(render_list_params, RENDER_LIST_MOTION, 0, virtual_geometry_main_commands, virtual_geometry_main_indices, virtual_geometry_disoccluded_commands);
 			_render_list_with_draw_list(&render_list_params, color_framebuffer);
 
 			RD::get_singleton()->draw_command_end_label();
@@ -2543,6 +2959,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, p_render_data);
 	}
 
+	// Consumed every frame, so a reset requested while no temporal effect runs doesn't linger.
+	const bool reset_temporal_history = rb->consume_temporal_history_reset();
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
 		if (scale_type == SCALE_FSR2) {
 			rb_data->ensure_fsr2(fsr2_effect);
@@ -2575,7 +2993,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.fovy = fovy;
 				params.jitter = jitter;
 				params.delta_time = float(time_step);
-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+				params.reset_accumulation = reset_temporal_history;
 
 				Projection correction;
 				correction.set_depth_correction(true, true, false);
@@ -2590,9 +3008,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 
 			RD::get_singleton()->draw_command_end_label();
+		} else if (scale_type == SCALE_CUSTOM) {
+			_process_custom_upscaler(p_render_data, reset_temporal_history);
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
-			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect) || reset_temporal_history;
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2622,7 +3042,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		} else if (using_taa) {
 			RD::get_singleton()->draw_command_begin_label("TAA");
 			RENDER_TIMESTAMP("TAA");
-			taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far);
+			taa->process(rb, rb->get_base_data_format(), p_render_data->scene_data->z_near, p_render_data->scene_data->z_far, reset_temporal_history);
 			RD::get_singleton()->draw_command_end_label();
 		}
 	}
@@ -2652,6 +3072,114 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			sdfgi->debug_draw(p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, size.x, size.y, rb->get_render_target(), source_texture, view_rids);
 		}
 	}
+}
+
+/* Custom upscalers */
+
+struct RenderForwardClusteredNativeUpscale {
+	Ref<RenderingUpscaler> upscaler;
+	Ref<RenderingUpscaleParameters> parameters;
+};
+
+static void _native_upscale_callback(RenderingDeviceDriver *p_driver, RenderingDeviceDriver::CommandBufferID p_command_buffer, void *p_userdata) {
+	RenderForwardClusteredNativeUpscale *call = static_cast<RenderForwardClusteredNativeUpscale *>(p_userdata);
+	const uint64_t handle = p_driver->get_resource_native_handle(RenderingDeviceDriver::DRIVER_RESOURCE_COMMAND_BUFFER, p_command_buffer);
+	call->upscaler->record_native_commands(handle, call->parameters);
+}
+
+void RenderForwardClustered::_free_native_upscale_calls() {
+	for (void *call : native_upscale_calls) {
+		memdelete(static_cast<RenderForwardClusteredNativeUpscale *>(call));
+	}
+	native_upscale_calls.clear();
+}
+
+void RenderForwardClustered::_process_custom_upscaler(RenderDataRD *p_render_data, bool p_reset) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	const Ref<RenderingUpscaler> &upscaler = rb->get_custom_upscaler();
+	ERR_FAIL_COND(upscaler.is_null());
+
+	// Native calls recorded in a previous frame have been executed by now.
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+	if (frame != native_upscale_frame) {
+		_free_native_upscale_calls();
+		native_upscale_frame = frame;
+	}
+
+	RID exposure;
+	if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+		exposure = luminance->get_current_luminance_buffer(rb);
+	}
+
+	const RenderSceneDataRD *scene_data = p_render_data->scene_data;
+
+	Projection correction;
+	correction.set_depth_correction(true, true, false);
+	const Projection reprojection = (correction * scene_data->prev_cam_projection) * scene_data->prev_cam_transform.affine_inverse() * scene_data->cam_transform * (correction * scene_data->cam_projection).inverse();
+
+	RD::get_singleton()->draw_command_begin_label("Custom Upscaler");
+	RENDER_TIMESTAMP("Custom Upscaler");
+
+	for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+		Ref<RenderingUpscaleParameters> parameters;
+		parameters.instantiate();
+		parameters->color = rb->get_internal_texture(v);
+		parameters->depth = rb->get_depth_texture(v);
+		parameters->velocity = rb->get_velocity_buffer(false, v);
+		parameters->reactive = rb->get_internal_texture_reactive(v);
+		parameters->exposure = exposure;
+		parameters->output = rb->get_upscaled_texture(v);
+		parameters->render_size = rb->get_internal_size();
+		parameters->target_size = rb->get_target_size();
+		parameters->jitter = scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
+		parameters->z_near = scene_data->z_near;
+		parameters->z_far = scene_data->z_far;
+		const real_t fov = scene_data->cam_projection.get_fov();
+		const real_t aspect = scene_data->cam_projection.get_aspect();
+		parameters->fov_y = Math::deg_to_rad(scene_data->cam_projection.get_fovy(fov, 1.0 / aspect));
+		parameters->delta_time = float(time_step);
+		parameters->sharpness = rb->get_fsr_sharpness();
+		parameters->reset = p_reset;
+		parameters->view = v;
+		parameters->view_count = rb->get_view_count();
+		parameters->frame = frame;
+		parameters->projection = scene_data->view_projection[v];
+		parameters->previous_projection = scene_data->prev_view_projection[v];
+		parameters->camera_transform = scene_data->cam_transform;
+		parameters->previous_camera_transform = scene_data->prev_cam_transform;
+		parameters->reprojection = reprojection;
+
+		if (upscaler->uses_native_commands()) {
+			RenderForwardClusteredNativeUpscale *call = memnew(RenderForwardClusteredNativeUpscale);
+			call->upscaler = upscaler;
+			call->parameters = parameters;
+			native_upscale_calls.push_back(call);
+
+			// Declare the resources used, so the render graph inserts the right barriers.
+			LocalVector<RD::CallbackResource> resources;
+			const RID inputs[5] = { parameters->color, parameters->depth, parameters->velocity, parameters->reactive, parameters->exposure };
+			for (const RID &input : inputs) {
+				if (input.is_valid()) {
+					RD::CallbackResource resource;
+					resource.rid = input;
+					resource.type = RD::CALLBACK_RESOURCE_TYPE_TEXTURE;
+					resource.usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE;
+					resources.push_back(resource);
+				}
+			}
+			RD::CallbackResource output;
+			output.rid = parameters->output;
+			output.type = RD::CALLBACK_RESOURCE_TYPE_TEXTURE;
+			output.usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE;
+			resources.push_back(output);
+
+			RD::get_singleton()->driver_callback_add(&_native_upscale_callback, call, resources);
+		} else {
+			upscaler->upscale(parameters);
+		}
+	}
+
+	RD::get_singleton()->draw_command_end_label();
 }
 
 void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_render_data) {
@@ -2687,7 +3215,7 @@ void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_re
 	}
 }
 
-void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, bool p_open_pass, bool p_close_pass, bool p_clear_region, RenderingServerTypes::RenderInfo *p_render_info, const Size2i &p_viewport_size, const Transform3D &p_main_cam_transform) {
+void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, bool p_open_pass, bool p_close_pass, bool p_clear_region, RenderingServerTypes::RenderInfo *p_render_info, const Size2i &p_viewport_size, const Transform3D &p_main_cam_transform, const RenderShadowData *p_shadow_data) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
 	ERR_FAIL_COND(!light_storage->owns_light_instance(p_light));
@@ -2714,6 +3242,14 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 
 	Projection light_projection;
 	Transform3D light_transform;
+
+	// Positional shadow static cache (see `RenderingServer::instance_geometry_set_shadow_mobility()`):
+	// static casters are drawn into the same rect of the static cache atlas only when they change,
+	// the rect is then copied to the shadow atlas and the dynamic casters (`p_instances`) are drawn on top of it.
+	const bool use_static_cache = p_shadow_data && p_shadow_data->use_static_cache && light_storage->light_get_type(base) != RSE::LIGHT_DIRECTIONAL;
+	const bool update_static_cache = use_static_cache && p_shadow_data->update_static_cache;
+	RID static_render_texture;
+	RID static_render_fb;
 
 	if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
 		//set pssm stuff
@@ -2777,6 +3313,7 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 		uint32_t subdivision = light_storage->shadow_atlas_get_quadrant_subdivision(p_shadow_atlas, quadrant);
 
 		ERR_FAIL_INDEX((int)shadow, light_storage->shadow_atlas_get_quadrant_shadow_size(p_shadow_atlas, quadrant));
+		ERR_FAIL_COND_MSG(use_static_cache && light_storage->shadow_atlas_get_static_fb(p_shadow_atlas).is_null(), "The positional shadow static cache was not allocated.");
 
 		uint32_t shadow_atlas_size = light_storage->shadow_atlas_get_size(p_shadow_atlas);
 		uint32_t quadrant_size = shadow_atlas_size >> 1;
@@ -2800,6 +3337,10 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 			if (light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
 				render_texture = light_storage->get_cubemap(shadow_size / 2);
 				render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass);
+				if (update_static_cache) {
+					static_render_texture = light_storage->get_cubemap(shadow_size / 2, true);
+					static_render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass, true);
+				}
 
 				light_projection = light_storage->light_instance_get_shadow_camera(p_light, p_pass);
 				light_transform = light_storage->light_instance_get_shadow_transform(p_light, p_pass);
@@ -2856,6 +3397,10 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 
 	if (render_cubemap) {
 		//rendering to cubemap
+		if (update_static_cache) {
+			// Static casters use the most detailed LOD, as the cache must stay valid when the camera moves.
+			_render_shadow_append(static_render_fb, p_shadow_data->static_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, false, false, use_pancake, p_lod_distance_multiplier, 0.0, Rect2(), false, true, true, true, p_render_info, p_viewport_size, p_main_cam_transform);
+		}
 		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, true, true, p_render_info, p_viewport_size, p_main_cam_transform);
 		if (finalize_cubemap) {
 			_render_shadow_process();
@@ -2864,18 +3409,60 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 			Rect2 atlas_rect_norm = atlas_rect;
 			atlas_rect_norm.position /= float(atlas_size);
 			atlas_rect_norm.size /= float(atlas_size);
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false);
-			atlas_rect_norm.position += Vector2(dual_paraboloid_offset) * atlas_rect_norm.size;
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, true);
+			Rect2 atlas_rect_norm_flip = atlas_rect_norm;
+			atlas_rect_norm_flip.position += Vector2(dual_paraboloid_offset) * atlas_rect_norm.size;
+			if (use_static_cache) {
+				RID static_atlas_fb = light_storage->shadow_atlas_get_static_fb(p_shadow_atlas);
+				if (update_static_cache) {
+					copy_effects->copy_cubemap_to_dp(static_render_texture, static_atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false);
+					copy_effects->copy_cubemap_to_dp(static_render_texture, static_atlas_fb, atlas_rect_norm_flip, atlas_rect.size, light_projection.get_z_near(), zfar, true);
+				}
+				// Convert the dynamic casters and merge them with the static ones, keeping the nearest depth.
+				RID static_atlas_texture = light_storage->shadow_atlas_get_static_texture(p_shadow_atlas);
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false, static_atlas_texture);
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm_flip, atlas_rect.size, light_projection.get_z_near(), zfar, true, static_atlas_texture);
+			} else {
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false);
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm_flip, atlas_rect.size, light_projection.get_z_near(), zfar, true);
+			}
 
 			//restore transform so it can be properly used
 			light_storage->light_instance_set_shadow_transform(p_light, Projection(), light_storage->light_instance_get_base_transform(p_light), zfar, 0, 0, 0);
 		}
 
+	} else if (use_static_cache) {
+		RID static_atlas_fb = light_storage->shadow_atlas_get_static_fb(p_shadow_atlas);
+		if (update_static_cache) {
+			// Static casters use the most detailed LOD, as the cache must stay valid when the camera moves.
+			_render_shadow_append(static_atlas_fb, p_shadow_data->static_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, 0.0, atlas_rect, flip_y, true, true, p_close_pass, p_render_info, p_viewport_size, p_main_cam_transform);
+		}
+		_render_shadow_append_depth_copy(light_storage->shadow_atlas_get_static_texture(p_shadow_atlas), render_fb, atlas_rect);
+		if (p_instances.size()) {
+			// Drawn on top of the static casters, without clearing.
+			_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, false, false, p_close_pass, p_render_info, p_viewport_size, p_main_cam_transform);
+		}
 	} else {
 		//render shadow
 		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, p_clear_region, p_open_pass, p_close_pass, p_render_info, p_viewport_size, p_main_cam_transform);
 	}
+}
+
+void RenderForwardClustered::_render_shadow_append_depth_copy(RID p_source_depth, RID p_framebuffer, const Rect2i &p_rect) {
+	SceneState::ShadowPass shadow_pass;
+	shadow_pass.element_from = 0;
+	shadow_pass.element_count = 0;
+	shadow_pass.pass_mode = PASS_MODE_SHADOW;
+	shadow_pass.lod_distance_multiplier = 0.0;
+	shadow_pass.screen_mesh_lod_threshold = 0.0;
+	shadow_pass.framebuffer = p_framebuffer;
+	shadow_pass.rect = p_rect;
+	shadow_pass.clear_depth = false;
+	shadow_pass.flip_cull = false;
+	shadow_pass.uniform_buffer_index = 0;
+	shadow_pass.vg_reverse_cull_face = false; // No elements, so no virtual geometry either.
+	shadow_pass.copy_depth_from = p_source_depth;
+
+	scene_state.shadow_passes.push_back(shadow_pass);
 }
 
 void RenderForwardClustered::_render_shadow_begin() {
@@ -2960,6 +3547,24 @@ void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const Page
 
 		shadow_pass.uniform_buffer_index = uniform_buffer_index;
 
+		// Shadows are culled from the light, but use the main camera for LOD so that the
+		// geometry casting shadows matches the geometry being seen (no self-shadowing
+		// artifacts between different levels of detail).
+		RendererRD::VirtualGeometry::ViewParams &vg_view = shadow_pass.vg_view;
+		vg_view.projection = p_projection;
+		vg_view.transform = p_transform;
+		vg_view.orthogonal = p_projection.is_orthogonal();
+		// Paraboloid projections aren't linear, so planes and cones can't be used.
+		vg_view.frustum_culling = !p_use_dp;
+		vg_view.cone_culling = !p_use_dp;
+		// Only the side planes: pancaking and depth clamping keep casters outside of the depth range.
+		vg_view.plane_mask = (1 << Projection::PLANE_LEFT) | (1 << Projection::PLANE_TOP) | (1 << Projection::PLANE_RIGHT) | (1 << Projection::PLANE_BOTTOM);
+		vg_view.lod_position = p_main_cam_transform.origin;
+		vg_view.lod_orthogonal = false;
+		vg_view.lod_distance_multiplier = p_lod_distance_multiplier;
+		vg_view.lod_threshold = scene_data.screen_mesh_lod_threshold;
+		shadow_pass.vg_reverse_cull_face = p_reverse_cull_face;
+
 		scene_state.shadow_passes.push_back(shadow_pass);
 	}
 }
@@ -2975,8 +3580,14 @@ void RenderForwardClustered::_render_shadow_process() {
 	for (uint32_t i = 0; i < scene_state.shadow_passes.size(); i++) {
 		//render passes need to be configured after instance buffer is done, since they need the latest version
 		SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[i];
+		if (shadow_pass.copy_depth_from.is_valid()) {
+			continue;
+		}
 		shadow_pass.rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_SECONDARY, nullptr, false, RID(), RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default(), shadow_pass.uniform_buffer_index, false);
 	}
+
+	// Select and compact the clusters of virtual geometry for every shadow pass at once.
+	_virtual_geometry_setup_shadows();
 
 	RD::get_singleton()->draw_command_end_label();
 }
@@ -2984,7 +3595,12 @@ void RenderForwardClustered::_render_shadow_end() {
 	RD::get_singleton()->draw_command_begin_label("Shadow Render");
 
 	for (SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
+		if (shadow_pass.copy_depth_from.is_valid()) {
+			copy_effects->copy_depth_to_fb_rect(shadow_pass.copy_depth_from, shadow_pass.framebuffer, shadow_pass.rect);
+			continue;
+		}
 		RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr() + shadow_pass.element_from, render_list[RENDER_LIST_SECONDARY].element_info.ptr() + shadow_pass.element_from, shadow_pass.element_count, shadow_pass.flip_cull, shadow_pass.pass_mode, 0, true, false, shadow_pass.rp_uniform_set, false, Vector2(), shadow_pass.lod_distance_multiplier, shadow_pass.screen_mesh_lod_threshold, 1, shadow_pass.element_from);
+		_virtual_geometry_apply(render_list_parameters, RENDER_LIST_SECONDARY, shadow_pass.element_from, virtual_geometry_shadow_commands, virtual_geometry_shadow_indices);
 		_render_list_with_draw_list(&render_list_parameters, shadow_pass.framebuffer, shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
 	}
 
@@ -4364,6 +4980,20 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
 
+	if (mesh_storage->mesh_surface_get_format(sdcache->surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+		sdcache->compressed_aabb = mesh_storage->mesh_surface_get_aabb(sdcache->surface);
+		sdcache->compressed_uv_scale = mesh_storage->mesh_surface_get_uv_scale(sdcache->surface);
+	}
+
+	// Virtual geometry is only used when the drawn triangles can be selected and culled with
+	// the static cluster bounds: opaque materials that don't move vertices. Transparent
+	// materials are excluded because their depth pre-pass must match the alpha pass exactly.
+	const SceneShaderForwardClustered::ShaderData *vg_shader = p_material->shader_data;
+	const bool vg_compatible_material = !(flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA | GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS)) && !vg_shader->uses_vertex && !vg_shader->uses_position && !vg_shader->writes_modelview_or_projection && !vg_shader->uses_point_size;
+	if (virtual_geometry && vg_compatible_material && ginstance->data->base_type == RSE::INSTANCE_MESH && sdcache->primitive == RSE::PRIMITIVE_TRIANGLES && mesh_storage->mesh_surface_has_virtual_geometry(sdcache->surface)) {
+		sdcache->flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_VIRTUAL_GEOMETRY;
+	}
+
 	if (ginstance->data->dirty_dependencies) {
 		RSG::utilities->base_update_dependency(p_mesh, &ginstance->data->dependency_tracker);
 	}
@@ -5219,6 +5849,8 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 RenderForwardClustered::RenderForwardClustered() {
 	singleton = this;
 
+	RendererRD::LightStorage::get_singleton()->set_shadow_static_cache_supported(true);
+
 	/* SCENE SHADER */
 
 	{
@@ -5372,6 +6004,7 @@ RenderForwardClustered::RenderForwardClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
+	virtual_geometry = memnew(RendererRD::VirtualGeometry);
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
@@ -5393,6 +6026,18 @@ RenderForwardClustered::~RenderForwardClustered() {
 		memdelete(fsr2_effect);
 		fsr2_effect = nullptr;
 	}
+
+	if (virtual_geometry) {
+		memdelete(virtual_geometry);
+		virtual_geometry = nullptr;
+	}
+
+	if (ray_tracing_tlas.is_valid()) {
+		RD::get_singleton()->free_rid(ray_tracing_tlas);
+		ray_tracing_tlas = RID();
+	}
+
+	_free_native_upscale_calls();
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	if (mfx_temporal_effect) {

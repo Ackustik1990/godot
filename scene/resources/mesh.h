@@ -320,6 +320,7 @@ private:
 		AABB aabb;
 		Ref<Material> material;
 		bool is_2d = false;
+		bool has_virtual_geometry = false;
 	};
 	Vector<Surface> surfaces;
 	mutable RID mesh;
@@ -391,6 +392,10 @@ public:
 	virtual RID get_rid() const override;
 
 	void regen_normal_maps();
+
+	Error generate_virtual_geometry(int p_surface = -1);
+	void clear_virtual_geometry();
+	bool surface_has_virtual_geometry(int p_surface) const;
 
 	Error lightmap_unwrap(const Transform3D &p_base_transform = Transform3D(), float p_texel_size = 0.05);
 	Error lightmap_unwrap_cached(const Transform3D &p_base_transform, float p_texel_size, const Vector<uint8_t> &p_src_cache, Vector<uint8_t> &r_dst_cache, bool p_generate_cache = true);

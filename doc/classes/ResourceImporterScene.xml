@@ -70,6 +70,9 @@
 		<member name="meshes/generate_lods" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], generates lower detail variants of the mesh which will be displayed in the distance to improve rendering performance. Not all meshes benefit from LOD, especially if they are never rendered from far away. Disabling this can reduce output file size and speed up importing. See [url=$DOCS_URL/tutorials/3d/mesh_lod.html#doc-mesh-lod]Mesh level of detail (LOD)[/url] for more information.
 		</member>
+		<member name="meshes/generate_virtual_geometry" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], builds virtual geometry (GPU-driven cluster level of detail and culling) for the meshes of the scene, see [method ArrayMesh.generate_virtual_geometry]. Useful for large and dense static meshes. Skinned meshes are skipped. It can be overridden per mesh in the Advanced Import Settings dialog.
+		</member>
 		<member name="meshes/light_baking" type="int" setter="" getter="" default="1">
 			Configures the meshes' [member GeometryInstance3D.gi_mode] in the 3D scene. If set to [b]Static Lightmaps[/b], sets the meshes' GI mode to Static and generates UV2 on import for [LightmapGI] baking.
 		</member>

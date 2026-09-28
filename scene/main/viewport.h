@@ -34,6 +34,7 @@
 #include "scene/resources/texture.h"
 #include "servers/display/display_server_enums.h"
 #include "servers/rendering/rendering_server_enums.h"
+#include "servers/rendering/rendering_upscaler.h"
 
 class AudioListener2D;
 class AudioStream;
@@ -106,6 +107,7 @@ public:
 		SCALING_3D_MODE_METALFX_SPATIAL,
 		SCALING_3D_MODE_METALFX_TEMPORAL,
 		SCALING_3D_MODE_NEAREST,
+		SCALING_3D_MODE_CUSTOM,
 		SCALING_3D_MODE_MAX
 	};
 
@@ -323,6 +325,7 @@ private:
 	bool use_taa = false;
 
 	Scaling3DMode scaling_3d_mode = SCALING_3D_MODE_BILINEAR;
+	Ref<RenderingUpscaler> scaling_3d_custom_upscaler;
 	float scaling_3d_scale = 1.0;
 	float fsr_sharpness = 0.2f;
 	float texture_mipmap_bias = 0.0f;
@@ -605,6 +608,11 @@ public:
 
 	void set_scaling_3d_mode(Scaling3DMode p_scaling_3d_mode);
 	Scaling3DMode get_scaling_3d_mode() const;
+
+	void set_scaling_3d_custom_upscaler(const Ref<RenderingUpscaler> &p_upscaler);
+	Ref<RenderingUpscaler> get_scaling_3d_custom_upscaler() const;
+
+	void reset_temporal_history();
 
 	void set_scaling_3d_scale(float p_scaling_3d_scale);
 	float get_scaling_3d_scale() const;

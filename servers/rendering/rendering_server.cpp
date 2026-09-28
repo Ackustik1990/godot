@@ -1990,6 +1990,10 @@ static RenderingServerTypes::SurfaceData _dict_to_surf(const Dictionary &p_dicti
 		sd.blend_shape_data = p_dictionary["blend_shape_data"];
 	}
 
+	if (p_dictionary.has("virtual_geometry_data")) {
+		sd.virtual_geometry_data = p_dictionary["virtual_geometry_data"];
+	}
+
 	if (p_dictionary.has("material")) {
 		sd.material = p_dictionary["material"];
 	}
@@ -2048,6 +2052,10 @@ Dictionary RenderingServer::_mesh_get_surface(RID p_mesh, int p_idx) {
 
 	if (sd.blend_shape_data.size()) {
 		d["blend_shape_data"] = sd.blend_shape_data;
+	}
+
+	if (sd.virtual_geometry_data.size()) {
+		d["virtual_geometry_data"] = sd.virtual_geometry_data;
 	}
 
 	if (sd.material.is_valid()) {
@@ -2539,6 +2547,8 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("light_set_distance_fade", "decal", "enabled", "begin", "shadow", "length"), &RenderingServer::light_set_distance_fade);
 	ClassDB::bind_method(D_METHOD("light_set_reverse_cull_face_mode", "light", "enabled"), &RenderingServer::light_set_reverse_cull_face_mode);
 	ClassDB::bind_method(D_METHOD("light_set_shadow_caster_mask", "light", "mask"), &RenderingServer::light_set_shadow_caster_mask);
+	ClassDB::bind_method(D_METHOD("light_set_shadow_caching", "light", "enabled"), &RenderingServer::light_set_shadow_caching);
+	ClassDB::bind_method(D_METHOD("light_set_shadow_dynamic_update_interval", "light", "frames"), &RenderingServer::light_set_shadow_dynamic_update_interval);
 	ClassDB::bind_method(D_METHOD("light_set_bake_mode", "light", "bake_mode"), &RenderingServer::light_set_bake_mode);
 	ClassDB::bind_method(D_METHOD("light_set_max_sdfgi_cascade", "light", "cascade"), &RenderingServer::light_set_max_sdfgi_cascade);
 	ClassDB::bind_method(D_METHOD("light_set_allow_contact_shadows", "light", "enable"), &RenderingServer::light_set_allow_contact_shadows);
@@ -2875,6 +2885,8 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("viewport_set_canvas_cull_mask", "viewport", "canvas_cull_mask"), &RenderingServer::viewport_set_canvas_cull_mask);
 
 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_mode", "viewport", "scaling_3d_mode"), &RenderingServer::viewport_set_scaling_3d_mode);
+	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_custom_upscaler", "viewport", "upscaler"), &RenderingServer::viewport_set_scaling_3d_custom_upscaler);
+	ClassDB::bind_method(D_METHOD("viewport_reset_temporal_history", "viewport"), &RenderingServer::viewport_reset_temporal_history);
 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_scale", "viewport", "scale"), &RenderingServer::viewport_set_scaling_3d_scale);
 	ClassDB::bind_method(D_METHOD("viewport_set_fsr_sharpness", "viewport", "sharpness"), &RenderingServer::viewport_set_fsr_sharpness);
 	ClassDB::bind_method(D_METHOD("viewport_set_texture_mipmap_bias", "viewport", "mipmap_bias"), &RenderingServer::viewport_set_texture_mipmap_bias);
@@ -2935,6 +2947,7 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
+	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_MAX);
 
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_UPDATE_DISABLED);
@@ -3248,6 +3261,7 @@ void RenderingServer::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_flag", "instance", "flag", "enabled"), &RenderingServer::instance_geometry_set_flag);
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_cast_shadows_setting", "instance", "shadow_casting_setting"), &RenderingServer::instance_geometry_set_cast_shadows_setting);
+	ClassDB::bind_method(D_METHOD("instance_geometry_set_shadow_mobility", "instance", "shadow_mobility"), &RenderingServer::instance_geometry_set_shadow_mobility);
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_material_override", "instance", "material"), &RenderingServer::instance_geometry_set_material_override);
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_material_overlay", "instance", "material"), &RenderingServer::instance_geometry_set_material_overlay);
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_visibility_range", "instance", "min", "max", "min_margin", "max_margin", "fade_mode"), &RenderingServer::instance_geometry_set_visibility_range);
@@ -3290,6 +3304,9 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::SHADOW_CASTING_SETTING_ON);
 	BIND_ENUM_CONSTANT(RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED);
 	BIND_ENUM_CONSTANT(RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY);
+
+	BIND_ENUM_CONSTANT(RSE::SHADOW_MOBILITY_DYNAMIC);
+	BIND_ENUM_CONSTANT(RSE::SHADOW_MOBILITY_STATIC);
 
 	BIND_ENUM_CONSTANT(RSE::VISIBILITY_RANGE_FADE_DISABLED);
 	BIND_ENUM_CONSTANT(RSE::VISIBILITY_RANGE_FADE_SELF);
@@ -3701,6 +3718,15 @@ void RenderingServer::init() {
 
 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/lights_and_shadows/multi_bounce_occlusion/enabled"), false);
 
+	GLOBAL_DEF("rendering/virtual_geometry/enabled", true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/virtual_geometry/max_index_buffer_size", PROPERTY_HINT_RANGE, "1,1024,1,suffix:M indices"), 64);
+	GLOBAL_DEF("rendering/virtual_geometry/occlusion_culling", true);
+
+	GLOBAL_DEF_RST("rendering/ray_tracing/enabled", false);
+	GLOBAL_DEF("rendering/ray_tracing/reflections", true);
+	GLOBAL_DEF("rendering/ray_tracing/ambient_occlusion", true);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/max_distance", PROPERTY_HINT_RANGE, "1,10000,0.1,or_greater,suffix:m"), 100.0);
+
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality", PROPERTY_HINT_ENUM, "Hard (Fastest),Soft Very Low (Faster),Soft Low (Fast),Soft Medium (Average),Soft High (Slow),Soft Ultra (Slowest)"), 2);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality.mobile", 0);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/atlas_16_bits", true);
@@ -3727,6 +3753,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/reflections/reflection_atlas/reflection_size", PROPERTY_HINT_RANGE, "4,4096,1"), 256);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/reflections/reflection_atlas/reflection_size.mobile", PROPERTY_HINT_RANGE, "4,2048,1"), 128);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/reflections/reflection_atlas/reflection_count", PROPERTY_HINT_RANGE, "1,256,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/reflections/reflection_probes/max_update_always_per_frame", PROPERTY_HINT_RANGE, "0,64,1,or_greater"), 0);
 	GLOBAL_DEF_RST("rendering/reflections/specular_occlusion/enabled", true);
 
 	GLOBAL_DEF("rendering/global_illumination/gi/use_half_resolution", false);
@@ -3779,7 +3806,7 @@ void RenderingServer::init() {
 		String mode_hints;
 		String mode_hints_metal;
 		{
-			Vector<String> mode_hints_arr = { "Nearest (Fastest):5", "Bilinear (Fastest):0", "FSR 1.0 (Fast):1", "FSR 2.2 (Slow):2" };
+			Vector<String> mode_hints_arr = { "Nearest (Fastest):5", "Bilinear (Fastest):0", "FSR 1.0 (Fast):1", "FSR 2.2 (Slow):2", "Custom (RenderingUpscaler):6" };
 			mode_hints = String(",").join(mode_hints_arr);
 
 			mode_hints_arr.push_back("MetalFX (Spatial - Fast):3");
@@ -3792,6 +3819,7 @@ void RenderingServer::init() {
 		GLOBAL_DEF_NOVAL(PropertyInfo(Variant::INT, "rendering/scaling_3d/mode.macos", PROPERTY_HINT_ENUM, mode_hints_metal), 0);
 	}
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/scaling_3d/scale", PROPERTY_HINT_RANGE, "0.1,2.0,0.0001"), 1.0);
+	GLOBAL_DEF(PropertyInfo(Variant::STRING, "rendering/scaling_3d/custom_upscaler_class", PROPERTY_HINT_TYPE_STRING, "RenderingUpscaler"), "");
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/scaling_3d/fsr_sharpness", PROPERTY_HINT_RANGE, "0,2,0.01"), 0.2f);
 
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/textures/default_filters/texture_mipmap_bias", PROPERTY_HINT_RANGE, "-2,2,0.001"), 0.0f);

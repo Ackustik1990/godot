@@ -30,9 +30,11 @@
 
 #include "mesh_storage.h"
 
+#include "core/config/project_settings.h"
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_types.h"
+#include "servers/rendering/virtual_geometry_format.h"
 
 using namespace RendererRD;
 
@@ -44,6 +46,8 @@ MeshStorage *MeshStorage::get_singleton() {
 
 MeshStorage::MeshStorage() {
 	singleton = this;
+
+	ray_tracing_enabled = GLOBAL_GET("rendering/ray_tracing/enabled") && RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 
 	default_rd_storage_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * 4);
 
@@ -196,6 +200,8 @@ MeshStorage::~MeshStorage() {
 	skeleton_shader.shader.version_free(skeleton_shader.version);
 
 	RD::get_singleton()->free_rid(default_rd_storage_buffer);
+
+	virtual_geometry_pool.finalize();
 
 	singleton = nullptr;
 }
@@ -376,8 +382,19 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	const bool use_as_storage = (new_surface.skin_data.size() || mesh->blend_shape_count > 0);
 	const bool requested_storage_buffer = (new_surface.format & RSE::ARRAY_FLAG_USE_STORAGE_BUFFER);
-	const BitField<RD::BufferCreationBits> as_storage_flag = (use_as_storage || requested_storage_buffer) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
-	const BitField<RD::BufferCreationBits> requested_storage_flag = requested_storage_buffer ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	BitField<RD::BufferCreationBits> as_storage_flag = (use_as_storage || requested_storage_buffer) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	BitField<RD::BufferCreationBits> requested_storage_flag = requested_storage_buffer ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+
+	// Static triangle meshes can be ray traced. Deformed meshes (skeletons, blend shapes) would need
+	// their acceleration structure rebuilt every frame, so they are left out.
+	s->ray_tracing_eligible = ray_tracing_enabled && new_surface.primitive == RSE::PRIMITIVE_TRIANGLES && !(new_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES) && !use_as_storage && new_surface.vertex_count > 0 && new_surface.vertex_data.size() && (new_surface.index_count > 0 || new_surface.vertex_count % 3 == 0);
+	const bool compressed_positions = new_surface.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
+	BitField<RD::BufferCreationBits> ray_tracing_input_flag = s->ray_tracing_eligible ? (RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) : 0;
+	BitField<RD::BufferCreationBits> vertex_flags = as_storage_flag;
+	if (!compressed_positions) {
+		// Uncompressed positions are tightly packed floats at the start of the vertex buffer.
+		vertex_flags = vertex_flags | ray_tracing_input_flag;
+	}
 
 	if (new_surface.vertex_data.size()) {
 		// If we have an uncompressed surface that contains normals, but not tangents, we need to differentiate the array
@@ -391,11 +408,31 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 			Vector<uint8_t> new_vertex_data;
 			new_vertex_data.resize_initialized(new_surface.vertex_data.size() + sizeof(uint16_t) * 2);
 			memcpy(new_vertex_data.ptrw(), new_surface.vertex_data.ptr(), new_surface.vertex_data.size());
-			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(new_vertex_data.size(), new_vertex_data, as_storage_flag);
+			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(new_vertex_data.size(), new_vertex_data, vertex_flags);
 			s->vertex_buffer_size = new_vertex_data.size();
 		} else {
-			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(new_surface.vertex_data.size(), new_surface.vertex_data, as_storage_flag);
+			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(new_surface.vertex_data.size(), new_surface.vertex_data, vertex_flags);
 			s->vertex_buffer_size = new_surface.vertex_data.size();
+		}
+
+		if (s->ray_tracing_eligible && compressed_positions) {
+			// Compressed positions are 16-bit normalized values relative to the AABB, a vertex format
+			// acceleration structures don't have to support: decode them to floats.
+			uint32_t offsets[RSE::ARRAY_MAX];
+			uint32_t vertex_element_size, normal_element_size, attrib_element_size, skin_element_size;
+			RS::get_singleton()->mesh_surface_make_offsets_from_format(new_surface.format, new_surface.vertex_count, new_surface.index_count, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size);
+			Vector<uint8_t> positions;
+			positions.resize(new_surface.vertex_count * sizeof(float) * 3);
+			float *w = reinterpret_cast<float *>(positions.ptrw());
+			const uint8_t *r = new_surface.vertex_data.ptr();
+			const AABB &aabb = new_surface.aabb;
+			for (uint32_t i = 0; i < new_surface.vertex_count; i++) {
+				const uint16_t *v = reinterpret_cast<const uint16_t *>(r + i * vertex_element_size + offsets[RSE::ARRAY_VERTEX]);
+				for (int j = 0; j < 3; j++) {
+					w[i * 3 + j] = float(v[j]) / 65535.0f * float(aabb.size[j]) + float(aabb.position[j]);
+				}
+			}
+			s->ray_tracing_position_buffer = RD::get_singleton()->vertex_buffer_create(positions.size(), positions, ray_tracing_input_flag);
 		}
 	}
 
@@ -417,7 +454,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	if (new_surface.index_count) {
 		bool is_index_16 = new_surface.vertex_count <= 65536 && new_surface.vertex_count > 0;
 
-		s->index_buffer = RD::get_singleton()->index_buffer_create(new_surface.index_count, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, new_surface.index_data, false, requested_storage_flag);
+		s->index_buffer = RD::get_singleton()->index_buffer_create(new_surface.index_count, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, new_surface.index_data, false, requested_storage_flag | ray_tracing_input_flag);
 		s->index_buffer_size = new_surface.index_data.size();
 		s->index_count = new_surface.index_count;
 		s->index_array = RD::get_singleton()->index_array_create(s->index_buffer, 0, s->index_count);
@@ -437,6 +474,14 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	}
 
 	ERR_FAIL_COND_MSG(!new_surface.index_count && !new_surface.vertex_count, "Meshes must contain a vertex array, an index array, or both");
+
+	if (!new_surface.virtual_geometry_data.is_empty()) {
+		if (new_surface.primitive == RSE::PRIMITIVE_TRIANGLES && !(new_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES) && VirtualGeometryFormat::validate(new_surface.virtual_geometry_data.ptr(), new_surface.virtual_geometry_data.size(), new_surface.vertex_count)) {
+			virtual_geometry_pool.queue_upload(&s->virtual_geometry, new_surface.virtual_geometry_data);
+		} else {
+			WARN_PRINT(vformat("Ignoring invalid virtual geometry data in mesh surface (mesh: '%s'). Regenerate it with ArrayMesh.generate_virtual_geometry().", mesh->path));
+		}
+	}
 
 	s->aabb = new_surface.aabb;
 	s->bone_aabbs = new_surface.bone_aabbs; //only really useful for returning them.
@@ -519,6 +564,13 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 	Mesh::Surface &s = *p_mesh->surfaces[p_surface];
 
+	if (s.ray_tracing_blas.is_valid()) {
+		RD::get_singleton()->free_rid(s.ray_tracing_blas);
+	}
+	if (s.ray_tracing_position_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(s.ray_tracing_position_buffer);
+	}
+
 	if (s.vertex_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.vertex_buffer); // Clears arrays as dependency automatically, including all versions.
 	}
@@ -547,7 +599,43 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 		RD::get_singleton()->free_rid(s.blend_shape_buffer);
 	}
 
+	if (s.virtual_geometry.cluster_count) {
+		virtual_geometry_pool.free(&s.virtual_geometry);
+	}
+
 	memdelete(p_mesh->surfaces[p_surface]);
+}
+
+RID MeshStorage::mesh_surface_get_blas(void *p_surface) {
+	Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+	if (!s->ray_tracing_eligible) {
+		return RID();
+	}
+	if (s->ray_tracing_blas.is_valid()) {
+		return s->ray_tracing_blas;
+	}
+
+	RD::AccelerationStructureGeometry geometry;
+	geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+	geometry.vertex_buffer = s->ray_tracing_position_buffer.is_valid() ? s->ray_tracing_position_buffer : s->vertex_buffer;
+	geometry.vertex_stride = sizeof(float) * 3;
+	geometry.vertex_count = s->vertex_count;
+	geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+	if (s->index_count > 0) {
+		geometry.index_buffer = s->index_buffer;
+		geometry.index_count = s->index_count;
+	}
+
+	s->ray_tracing_blas = RD::get_singleton()->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+	if (s->ray_tracing_blas.is_null() || RD::get_singleton()->blas_build(s->ray_tracing_blas) != OK) {
+		if (s->ray_tracing_blas.is_valid()) {
+			RD::get_singleton()->free_rid(s->ray_tracing_blas);
+			s->ray_tracing_blas = RID();
+		}
+		s->ray_tracing_eligible = false; // Don't try again every frame.
+		return RID();
+	}
+	return s->ray_tracing_blas;
 }
 
 int MeshStorage::mesh_get_blend_shape_count(RID p_mesh) const {
@@ -580,7 +668,20 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
 
-	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->vertex_buffer, p_offset, data_size, r);
+	Mesh::Surface *s = mesh->surfaces[p_surface];
+	RD::get_singleton()->buffer_update(s->vertex_buffer, p_offset, data_size, r);
+
+	if (s->ray_tracing_blas.is_valid()) {
+		// Rebuilt from the new positions on next use.
+		RD::get_singleton()->free_rid(s->ray_tracing_blas);
+		s->ray_tracing_blas = RID();
+	}
+	if (s->ray_tracing_position_buffer.is_valid()) {
+		// The decoded copy of compressed positions isn't updated; stop ray tracing this surface.
+		RD::get_singleton()->free_rid(s->ray_tracing_position_buffer);
+		s->ray_tracing_position_buffer = RID();
+		s->ray_tracing_eligible = false;
+	}
 }
 
 void MeshStorage::mesh_surface_update_attribute_region(RID p_mesh, int p_surface, int p_offset, const Vector<uint8_t> &p_data) {
@@ -711,6 +812,10 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 
 	if (s.blend_shape_buffer.is_valid()) {
 		sd.blend_shape_data = RD::get_singleton()->buffer_get_data(s.blend_shape_buffer);
+	}
+
+	if (s.virtual_geometry.cluster_count) {
+		sd.virtual_geometry_data = virtual_geometry_pool.read(&s.virtual_geometry);
 	}
 
 	return sd;
@@ -994,6 +1099,7 @@ void MeshStorage::mesh_debug_usage(List<RenderingServerTypes::MeshInfo> *r_info)
 			for (uint32_t lod_index = 0; lod_index < surface->lod_count; lod_index++) {
 				mesh_info.lod_index_buffers_size += surface->lods[lod_index].index_buffer_size;
 			}
+			mesh_info.virtual_geometry_size += surface->virtual_geometry.cluster_count * sizeof(VirtualGeometryFormat::Cluster) + surface->virtual_geometry.data_count * sizeof(uint32_t);
 		}
 
 		r_info->push_back(mesh_info);

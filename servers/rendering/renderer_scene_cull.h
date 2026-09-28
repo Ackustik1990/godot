@@ -39,6 +39,7 @@
 #include "core/templates/pass_func.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
+#include "servers/rendering/frustum_cull_simd.h"
 #include "servers/rendering/instance_uniforms.h"
 #include "servers/rendering/renderer_scene_occlusion_cull.h"
 #include "servers/rendering/renderer_scene_render.h"
@@ -165,6 +166,7 @@ public:
 		const Plane *planes_ptr;
 		const PlaneSign *plane_signs_ptr;
 		uint32_t plane_count;
+		FrustumCullSIMD simd; // Structure of arrays copy of the planes for the SIMD test.
 
 		_ALWAYS_INLINE_ Frustum() {}
 		_ALWAYS_INLINE_ Frustum(const Frustum &p_frustum) {
@@ -174,6 +176,7 @@ public:
 			planes_ptr = planes.ptr();
 			plane_signs_ptr = plane_signs.ptr();
 			plane_count = p_frustum.plane_count;
+			simd = p_frustum.simd;
 		}
 		_ALWAYS_INLINE_ void operator=(const Frustum &p_frustum) {
 			planes = p_frustum.planes;
@@ -182,6 +185,7 @@ public:
 			planes_ptr = planes.ptr();
 			plane_signs_ptr = plane_signs.ptr();
 			plane_count = p_frustum.plane_count;
+			simd = p_frustum.simd;
 		}
 		_ALWAYS_INLINE_ Frustum(const Vector<Plane> &p_planes) {
 			planes = p_planes;
@@ -193,6 +197,7 @@ public:
 			}
 
 			plane_signs_ptr = plane_signs.ptr();
+			simd.setup(planes_ptr, plane_count);
 		}
 	};
 
@@ -215,6 +220,15 @@ public:
 		_ALWAYS_INLINE_ bool in_frustum(const Frustum &p_frustum) const {
 			// This is not a full SAT check and the possibility of false positives exist,
 			// but the tradeoff vs performance is still very good.
+
+#ifndef REAL_T_IS_DOUBLE
+			if constexpr (FrustumCullSIMD::has_simd) {
+				// Same test, evaluated for 4 planes at a time (about 2x faster).
+				if (likely(p_frustum.simd.valid)) {
+					return p_frustum.simd.box_in_frustum(bounds);
+				}
+			}
+#endif
 
 			for (uint32_t i = 0; i < p_frustum.plane_count; i++) {
 				Vector3 min(
@@ -433,6 +447,7 @@ public:
 		bool baked_light : 1; // This flag is only to know if it actually did use baked light.
 		bool dynamic_gi : 1; // Same as above for dynamic objects.
 		bool redraw_if_visible : 1;
+		bool shadow_mobility_static : 1; // RSE::SHADOW_MOBILITY_STATIC, see RenderingServer::instance_geometry_set_shadow_mobility().
 
 		Instance *lightmap = nullptr;
 		Rect2 lightmap_uv_scale;
@@ -574,6 +589,7 @@ public:
 			baked_light = true;
 			dynamic_gi = false;
 			redraw_if_visible = false;
+			shadow_mobility_static = false;
 
 			lightmap_slice_index = 0;
 			lightmap = nullptr;
@@ -614,6 +630,12 @@ public:
 			memdelete(base_data);
 			memdelete(custom_aabb);
 		}
+
+		// Particles are simulated on the GPU and change every frame without notifying the lights,
+		// so they are always drawn as dynamic shadow casters.
+		_FORCE_INLINE_ bool is_static_shadow_caster() const {
+			return shadow_mobility_static && base_type != RSE::INSTANCE_PARTICLES;
+		}
 	};
 
 	mutable SelfList<Instance>::List _instance_update_list;
@@ -647,6 +669,7 @@ public:
 		SelfList<InstanceReflectionProbeData> update_list;
 
 		int render_step;
+		uint64_t last_update_frame = 0; // Frame of the last full update, used to share the budget of UPDATE_ALWAYS probes.
 
 		InstanceReflectionProbeData() :
 				update_list(this) {
@@ -705,6 +728,14 @@ public:
 		uint32_t max_sdfgi_cascade = 2;
 		uint32_t cull_mask = 0xFFFFFFFF;
 
+		// Positional shadow static cache (see `RenderingServer::instance_geometry_set_shadow_mobility()`).
+		// Bumped whenever the light itself or a static shadow caster in its range changes.
+		uint64_t static_shadow_version = 1;
+		// Last `static_shadow_version` scheduled for rendering.
+		uint64_t static_shadow_version_scheduled = 0;
+		// Frame of the last shadow update, for `RenderingServer::light_set_shadow_dynamic_update_interval()`.
+		uint64_t last_shadow_update_frame = 0;
+
 	private:
 		// Instead of a single dirty flag, we maintain a count
 		// so that we can detect lights that are being made dirty
@@ -718,6 +749,19 @@ public:
 	public:
 		bool is_shadow_dirty() const { return shadow_dirty_count != 0; }
 		void make_shadow_dirty() { shadow_dirty_count = light_intersects_multiple_cameras ? 1 : 2; }
+		// The light itself changed, the static shadow cache is invalid too.
+		void make_static_shadow_dirty() {
+			static_shadow_version++;
+			make_shadow_dirty();
+		}
+		// A shadow caster changed. Only static casters invalidate the static shadow cache.
+		void make_shadow_dirty_for_caster(const Instance *p_caster) {
+			if (p_caster->is_static_shadow_caster()) {
+				static_shadow_version++;
+			}
+			make_shadow_dirty();
+		}
+		bool is_static_shadow_dirty() const { return static_shadow_version != static_shadow_version_scheduled; }
 		void detect_light_intersects_multiple_cameras(uint32_t p_frame_id) {
 			// We need to detect the case where shadow updates are occurring
 			// more than once per frame. In this case, we need to turn off
@@ -882,6 +926,9 @@ public:
 
 	PagedArray<Instance *> instance_cull_result;
 	PagedArray<Instance *> instance_shadow_cull_result;
+
+	// Instances around the camera traced by ray traced effects (not culled against the frustum).
+	PagedArray<RenderGeometryInstance *> ray_tracing_instances;
 
 	struct InstanceCullResult {
 		PagedArray<RenderGeometryInstance *> geometry_instances;
@@ -1057,6 +1104,7 @@ public:
 
 	virtual void instance_geometry_set_flag(RID p_instance, RSE::InstanceFlags p_flags, bool p_enabled);
 	virtual void instance_geometry_set_cast_shadows_setting(RID p_instance, RSE::ShadowCastingSetting p_shadow_casting_setting);
+	virtual void instance_geometry_set_shadow_mobility(RID p_instance, RSE::ShadowMobility p_shadow_mobility);
 	virtual void instance_geometry_set_material_override(RID p_instance, RID p_material);
 	virtual void instance_geometry_set_material_overlay(RID p_instance, RID p_material);
 
@@ -1082,6 +1130,8 @@ public:
 	void _light_instance_setup_directional_shadow(int p_shadow_index, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
 
 	_FORCE_INLINE_ bool _light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers = 0xFFFFFF);
+	bool _light_instance_schedule_static_shadow_cache(InstanceLightData *p_light, RID p_shadow_atlas);
+	static void _light_instance_extract_static_shadow_casters(PagedArray<Instance *> &r_casters, RendererSceneRender::RenderShadowData &r_shadow_data, bool p_update_static_cache, uint32_t p_caster_mask);
 
 	RID _render_get_environment(RID p_camera, RID p_scenario);
 	RID _render_get_compositor(RID p_camera, RID p_scenario);

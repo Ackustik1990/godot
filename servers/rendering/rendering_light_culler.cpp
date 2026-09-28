@@ -90,6 +90,7 @@ void RenderingLightCuller::prepare_directional_light_begin(const RendererSceneCu
 	directional_cull_planes.light_source.dir.normalize();
 	for (LightCullPlanes &planes : directional_cull_planes.planes) {
 		planes.num_cull_planes = 0;
+		planes.simd.setup(planes.cull_planes, 0);
 	}
 }
 
@@ -103,6 +104,7 @@ void RenderingLightCuller::prepare_directional_light_cascade(int32_t p_direction
 	LightCullPlanes &destination = directional_cull_planes.planes[p_cascade];
 	destination.num_cull_planes = 0;
 	_add_light_camera_planes(destination, directional_cull_planes.light_source, { p_receiver_frustum_planes.ptr(), p_receiver_frustum_points });
+	destination.simd.setup(destination.cull_planes, destination.num_cull_planes);
 }
 
 bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_instance) {
@@ -151,6 +153,15 @@ bool RenderingLightCuller::cull_directional_light(const RendererSceneCull::Insta
 	ERR_FAIL_INDEX_V(p_directional_light_id, (int32_t)data.directional_cull_planes.size(), true);
 
 	LightCullPlanes &cull_planes = data.directional_cull_planes[p_directional_light_id].planes[p_cascade];
+
+#if !defined(REAL_T_IS_DOUBLE) && !defined(LIGHT_CULLER_DEBUG_DIRECTIONAL_LIGHT)
+	if constexpr (FrustumCullSIMD::has_simd) {
+		// Called for every instance and cascade: test 4 planes at a time.
+		if (likely(cull_planes.simd.valid)) {
+			return cull_planes.simd.box_in_frustum(p_bound.bounds);
+		}
+	}
+#endif
 
 	Vector3 mins = Vector3(p_bound.bounds[0], p_bound.bounds[1], p_bound.bounds[2]);
 	Vector3 maxs = Vector3(p_bound.bounds[3], p_bound.bounds[4], p_bound.bounds[5]);

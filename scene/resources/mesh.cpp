@@ -34,6 +34,7 @@
 #include "core/object/class_db.h"
 #include "core/templates/pair.h"
 #include "scene/resources/surface_tool.h"
+#include "scene/resources/virtual_geometry_builder.h"
 #include "servers/rendering/rendering_server.h"
 
 #ifndef PHYSICS_3D_DISABLED
@@ -1567,6 +1568,10 @@ Array ArrayMesh::_get_surfaces() const {
 			data["blend_shapes"] = surface.blend_shape_data;
 		}
 
+		if (surface.virtual_geometry_data.size()) {
+			data["virtual_geometry"] = surface.virtual_geometry_data;
+		}
+
 		if (surfaces[i].material.is_valid()) {
 			data["material"] = surfaces[i].material;
 		}
@@ -1652,6 +1657,10 @@ void ArrayMesh::_set_surfaces(const Array &p_surfaces) {
 			surface.blend_shape_data = d["blend_shapes"];
 		}
 
+		if (d.has("virtual_geometry")) {
+			surface.virtual_geometry_data = d["virtual_geometry"];
+		}
+
 		Ref<Material> material;
 		if (d.has("material")) {
 			material = d["material"];
@@ -1723,6 +1732,7 @@ void ArrayMesh::_set_surfaces(const Array &p_surfaces) {
 		s.primitive = PrimitiveType(surface_data[i].primitive);
 		s.array_length = surface_data[i].vertex_count;
 		s.index_array_length = surface_data[i].index_count;
+		s.has_virtual_geometry = !surface_data[i].virtual_geometry_data.is_empty();
 
 		surfaces.push_back(s);
 	}
@@ -2077,6 +2087,62 @@ void ArrayMesh::regen_normal_maps() {
 	}
 }
 
+Error ArrayMesh::generate_virtual_geometry(int p_surface) {
+	ERR_FAIL_COND_V_MSG(!VirtualGeometryBuilder::is_available(), ERR_UNAVAILABLE, "Virtual geometry is not available: the meshoptimizer module is disabled.");
+	ERR_FAIL_COND_V(p_surface < -1 || p_surface >= surfaces.size(), ERR_INVALID_PARAMETER);
+
+	Array surface_dictionaries = _get_surfaces();
+	bool changed = false;
+	for (int i = 0; i < surfaces.size(); i++) {
+		if (p_surface != -1 && i != p_surface) {
+			continue;
+		}
+		if (surfaces[i].primitive != PRIMITIVE_TRIANGLES || surfaces[i].is_2d) {
+			ERR_FAIL_COND_V_MSG(p_surface != -1, ERR_INVALID_PARAMETER, "Virtual geometry can only be generated for 3D triangle surfaces.");
+			continue;
+		}
+
+		const Vector<uint8_t> data = VirtualGeometryBuilder::build_from_arrays(surface_get_arrays(i));
+		if (data.is_empty()) {
+			ERR_FAIL_COND_V_MSG(p_surface != -1, ERR_CANT_CREATE, vformat("Failed to generate virtual geometry for surface %d.", i));
+			continue;
+		}
+
+		Dictionary surface = surface_dictionaries[i];
+		surface["virtual_geometry"] = data;
+		changed = true;
+	}
+
+	if (changed) {
+		_set_surfaces(surface_dictionaries);
+		emit_changed();
+	}
+	return OK;
+}
+
+void ArrayMesh::clear_virtual_geometry() {
+	bool has_any = false;
+	for (const Surface &surface : surfaces) {
+		has_any = has_any || surface.has_virtual_geometry;
+	}
+	if (!has_any) {
+		return;
+	}
+
+	Array surface_dictionaries = _get_surfaces();
+	for (int i = 0; i < surface_dictionaries.size(); i++) {
+		Dictionary surface = surface_dictionaries[i];
+		surface.erase("virtual_geometry");
+	}
+	_set_surfaces(surface_dictionaries);
+	emit_changed();
+}
+
+bool ArrayMesh::surface_has_virtual_geometry(int p_surface) const {
+	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), false);
+	return surfaces[p_surface].has_virtual_geometry;
+}
+
 //dirty hack
 bool (*array_mesh_lightmap_unwrap_callback)(float p_texel_size, const float *p_vertices, const float *p_normals, int p_vertex_count, const int *p_indices, int p_index_count, const uint8_t *p_cache_data, bool *r_use_cache, uint8_t **r_mesh_cache, int *r_mesh_cache_size, float **r_uv, int **r_vertex, int *r_vertex_count, int **r_index, int *r_index_count, int *r_size_hint_x, int *r_size_hint_y) = nullptr;
 
@@ -2324,6 +2390,9 @@ void ArrayMesh::_bind_methods() {
 	ClassDB::set_method_flags(get_class_static(), StringName("regen_normal_maps"), METHOD_FLAGS_DEFAULT | METHOD_FLAG_EDITOR);
 	ClassDB::bind_method(D_METHOD("lightmap_unwrap", "transform", "texel_size"), &ArrayMesh::lightmap_unwrap);
 	ClassDB::set_method_flags(get_class_static(), StringName("lightmap_unwrap"), METHOD_FLAGS_DEFAULT | METHOD_FLAG_EDITOR);
+	ClassDB::bind_method(D_METHOD("generate_virtual_geometry", "surf_idx"), &ArrayMesh::generate_virtual_geometry, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("clear_virtual_geometry"), &ArrayMesh::clear_virtual_geometry);
+	ClassDB::bind_method(D_METHOD("surface_has_virtual_geometry", "surf_idx"), &ArrayMesh::surface_has_virtual_geometry);
 
 	ClassDB::bind_method(D_METHOD("set_custom_aabb", "aabb"), &ArrayMesh::set_custom_aabb);
 	ClassDB::bind_method(D_METHOD("get_custom_aabb"), &ArrayMesh::get_custom_aabb);

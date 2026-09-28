@@ -95,6 +95,7 @@ public:
 		s->mesh_to_skeleton_xform = p_surface.mesh_to_skeleton_xform;
 		s->blend_shape_data = p_surface.blend_shape_data;
 		s->uv_scale = p_surface.uv_scale;
+		s->virtual_geometry_data = p_surface.virtual_geometry_data;
 		s->material = p_surface.material;
 		m->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 	}

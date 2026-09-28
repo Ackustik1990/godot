@@ -36,12 +36,14 @@
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_downsample.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_filter.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_hiz.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_ray_query.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ss_effects_downsample.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao_importance_map.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssao_interleave.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/ssao_ray_query.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssil.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssil_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/ssil_importance_map.glsl.gen.h"
@@ -76,6 +78,14 @@ class RenderSceneBuffersRD;
 namespace RendererRD {
 
 class CopyEffects;
+
+// Reflection probes of the frame, used by ray traced reflections to shade hits that aren't on screen.
+struct RayTracedReflectionProbes {
+	RID buffer;
+	uint32_t count = 0;
+	RID atlas;
+	Size2 atlas_border_size;
+};
 
 class SSEffects {
 private:
@@ -128,6 +138,12 @@ public:
 		int buffer_height;
 		int half_buffer_width;
 		int half_buffer_height;
+
+		// Ray traced AO accumulates over frames: camera of the frame stored in the history.
+		Projection ray_traced_last_projections[2];
+		Transform3D ray_traced_last_transform;
+		uint32_t ray_traced_history_index = 0;
+		uint64_t ray_traced_history_frame = 0;
 	};
 
 	struct SSAOSettings {
@@ -144,6 +160,11 @@ public:
 	void ssao_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, const SSAOSettings &p_settings);
 	void generate_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, uint32_t p_view, RID p_normal_buffer, const Projection &p_projection, const SSAOSettings &p_settings);
 
+	// Ray traced ambient occlusion against p_tlas (an acceleration structure of the scene in view
+	// space), written to the same texture as SSAO. p_frame varies the ray pattern over time.
+	void generate_ray_traced_ao(Ref<RenderSceneBuffersRD> p_render_buffers, SSAORenderBuffers &p_ssao_buffers, uint32_t p_view, RID p_normal_buffer, const Projection &p_projection, const Transform3D &p_camera_transform, const SSAOSettings &p_settings, RID p_tlas, uint64_t p_frame);
+	bool is_ray_traced_ao_available() const { return ssao_ray_query.available; }
+
 	/* Screen Space Reflection */
 	void ssr_set_half_size(bool p_half_size);
 
@@ -154,7 +175,11 @@ public:
 	};
 
 	void ssr_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RD::DataFormat p_color_format);
-	void screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RID *p_normal_roughness_slices, int p_max_steps, float p_fade_in, float p_fade_out, float p_tolerance, const Projection *p_projections, const Projection *p_reprojections, const Vector3 *p_eye_offsets, RendererRD::CopyEffects &p_copy_effects);
+	// With p_tlas (an acceleration structure of the scene in view space, see
+	// is_ray_traced_ssr_available()), reflection rays are traced against the scene up to
+	// p_max_distance instead of being marched through the depth buffer.
+	void screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffers, SSRRenderBuffers &p_ssr_buffers, const RID *p_normal_roughness_slices, int p_max_steps, float p_fade_in, float p_fade_out, float p_tolerance, const Projection *p_projections, const Projection *p_reprojections, const Vector3 *p_eye_offsets, RendererRD::CopyEffects &p_copy_effects, RID p_tlas = RID(), float p_max_distance = 0.0, const RayTracedReflectionProbes &p_probes = RayTracedReflectionProbes());
+	bool is_ray_traced_ssr_available() const { return ssr.ray_query_available; }
 
 	/* subsurface scattering */
 	void sss_set_quality(RSE::SubSurfaceScatteringQuality p_quality);
@@ -481,6 +506,18 @@ private:
 		int32_t pad[3];
 	};
 
+	struct ScreenSpaceReflectionRayQueryPushConstant {
+		int32_t screen_size[2];
+		int32_t mipmaps;
+		float max_distance;
+		float pad[2];
+		float depth_tolerance;
+		int32_t orthogonal;
+		uint32_t view_index;
+		uint32_t reflection_count;
+		float reflection_atlas_border_size[2];
+	};
+
 	struct ScreenSpaceReflectionFilterPushConstant {
 		int32_t screen_size[2];
 		uint32_t mip_level;
@@ -506,6 +543,13 @@ private:
 		PipelineDeferredRD ssr_pipeline;
 		RID ubo;
 
+		// Ray traced trace pass, only created when meshes have acceleration structures.
+		ScreenSpaceReflectionRayQueryShaderRD ray_query_shader;
+		RID ray_query_shader_version;
+		PipelineDeferredRD ray_query_pipeline;
+		RID ray_query_dummy_buffer; // Bound when there are no reflection probes.
+		bool ray_query_available = false;
+
 		ScreenSpaceReflectionFilterShaderRD filter_shader;
 		RID filter_shader_version;
 		PipelineDeferredRD filter_pipeline;
@@ -514,6 +558,44 @@ private:
 		RID resolve_shader_version;
 		PipelineDeferredRD resolve_pipeline;
 	} ssr;
+
+	/* Ray traced ambient occlusion */
+
+	enum SSAORayQueryMode {
+		SSAO_RAY_QUERY_MODE_TRACE,
+		SSAO_RAY_QUERY_MODE_TEMPORAL,
+		SSAO_RAY_QUERY_MODE_BLUR,
+		SSAO_RAY_QUERY_MODE_MAX
+	};
+
+	enum SSAORayQueryFlags {
+		SSAO_RAY_QUERY_FLAG_BLUR_VERTICAL = 1,
+		SSAO_RAY_QUERY_FLAG_HISTORY_VALID = 2,
+	};
+
+	struct SSAORayQueryReprojection {
+		float current_to_previous_view[16];
+		float previous_projection[16];
+	};
+
+	struct SSAORayQueryPushConstant {
+		float inv_projection[16];
+		int32_t screen_size[2];
+		float radius;
+		float intensity;
+		float power;
+		uint32_t frame;
+		uint32_t ray_count;
+		uint32_t flags;
+	};
+
+	struct SSAORayQuery {
+		SsaoRayQueryShaderRD shader;
+		RID shader_version;
+		PipelineDeferredRD pipelines[SSAO_RAY_QUERY_MODE_MAX];
+		RID reprojection_ubo;
+		bool available = false;
+	} ssao_ray_query;
 
 	/* Screen Space Shadows */
 

@@ -500,6 +500,8 @@ public:
 	FUNC5(light_set_distance_fade, RID, bool, float, float, float)
 	FUNC2(light_set_reverse_cull_face_mode, RID, bool)
 	FUNC2(light_set_shadow_caster_mask, RID, uint32_t)
+	FUNC2(light_set_shadow_caching, RID, bool)
+	FUNC2(light_set_shadow_dynamic_update_interval, RID, int)
 	FUNC2(light_set_bake_mode, RID, RSE::LightBakeMode)
 	FUNC2(light_set_max_sdfgi_cascade, RID, uint32_t)
 	FUNC2(light_set_allow_contact_shadows, RID, bool)
@@ -759,6 +761,8 @@ public:
 	FUNC2(viewport_set_render_direct_to_screen, RID, bool)
 
 	FUNC2(viewport_set_scaling_3d_mode, RID, RSE::ViewportScaling3DMode)
+	FUNC2(viewport_set_scaling_3d_custom_upscaler, RID, const Ref<RenderingUpscaler> &)
+	FUNC1(viewport_reset_temporal_history, RID)
 	FUNC2(viewport_set_scaling_3d_scale, RID, float)
 	FUNC2(viewport_set_fsr_sharpness, RID, float)
 	FUNC2(viewport_set_texture_mipmap_bias, RID, float)
@@ -974,6 +978,7 @@ public:
 
 	FUNC3(instance_geometry_set_flag, RID, RSE::InstanceFlags, bool)
 	FUNC2(instance_geometry_set_cast_shadows_setting, RID, RSE::ShadowCastingSetting)
+	FUNC2(instance_geometry_set_shadow_mobility, RID, RSE::ShadowMobility)
 	FUNC2(instance_geometry_set_material_override, RID, RID)
 	FUNC2(instance_geometry_set_material_overlay, RID, RID)
 
