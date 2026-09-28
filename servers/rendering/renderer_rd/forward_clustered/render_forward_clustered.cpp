@@ -3459,6 +3459,7 @@ void RenderForwardClustered::_render_shadow_append_depth_copy(RID p_source_depth
 	shadow_pass.clear_depth = false;
 	shadow_pass.flip_cull = false;
 	shadow_pass.uniform_buffer_index = 0;
+	shadow_pass.vg_reverse_cull_face = false; // No elements, so no virtual geometry either.
 	shadow_pass.copy_depth_from = p_source_depth;
 
 	scene_state.shadow_passes.push_back(shadow_pass);

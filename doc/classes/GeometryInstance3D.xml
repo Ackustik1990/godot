@@ -70,7 +70,7 @@
 			Whether this geometry is a static or a dynamic shadow caster for lights that use shadow caching (see [member Light3D.shadow_cache_enabled]).
 			Static shadow casters are drawn into a cached shadow map, which is only redrawn when the light changes or when a static shadow caster in the light's range is added, removed, moved, hidden or modified. Dynamic shadow casters are drawn on top of a copy of the cached shadow map every time the shadow is updated.
 			Set this to [constant SHADOW_MOBILITY_STATIC] on geometry that doesn't move (such as level geometry), and keep [constant SHADOW_MOBILITY_DYNAMIC] on moving or animated geometry (such as characters). Moving a static shadow caster is supported, but redraws the cached shadow maps of all lights that affect it.
-			[b]Note:[/b] Static shadow casters that use an animated material (for example, a shader that reads [code]TIME[/code]) are always drawn as dynamic shadow casters.
+			[b]Note:[/b] Static shadow casters that use an animated material (for example, a shader that reads [code]TIME[/code]) and [GPUParticles3D] are always drawn as dynamic shadow casters.
 			[b]Note:[/b] Only supported for [OmniLight3D] and [SpotLight3D] shadows when using the Forward+ rendering method. Otherwise, this property has no effect.
 		</member>
 		<member name="transparency" type="float" setter="set_transparency" getter="get_transparency" default="0.0" keywords="opacity">

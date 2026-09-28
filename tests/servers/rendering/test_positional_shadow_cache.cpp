@@ -139,7 +139,9 @@ TEST_CASE("[RendererSceneCull] Static shadow casters are split from dynamic ones
 	RendererSceneCull::Instance *static_hidden = _make_caster(5, true);
 	static_hidden->visible = false;
 	RendererSceneCull::Instance *static_other_layer = _make_caster(6, true, 2);
-	RendererSceneCull::Instance *all[] = { dynamic_a, static_a, dynamic_b, static_b, static_animated, static_hidden, static_other_layer };
+	RendererSceneCull::Instance *static_particles = _make_caster(7, true);
+	static_particles->base_type = RSE::INSTANCE_PARTICLES;
+	RendererSceneCull::Instance *all[] = { dynamic_a, static_a, dynamic_b, static_b, static_animated, static_hidden, static_other_layer, static_particles };
 
 	PagedArray<RendererSceneCull::Instance *> casters;
 	casters.set_page_pool(&instance_pool);
@@ -155,11 +157,12 @@ TEST_CASE("[RendererSceneCull] Static shadow casters are split from dynamic ones
 		CHECK(shadow_data.use_static_cache);
 		CHECK(shadow_data.update_static_cache);
 
-		// Dynamic casters, and static ones with animated materials, stay in the list drawn on every update.
-		CHECK(casters.size() == 3);
+		// Dynamic casters, static ones with animated materials and particles stay in the list drawn on every update.
+		CHECK(casters.size() == 4);
 		CHECK(_has_instance(casters, dynamic_a));
 		CHECK(_has_instance(casters, dynamic_b));
 		CHECK_MESSAGE(_has_instance(casters, static_animated), "Static casters with animated materials are drawn as dynamic casters.");
+		CHECK_MESSAGE(_has_instance(casters, static_particles), "Particles are always drawn as dynamic casters.");
 
 		// Only the static casters that can be seen by the light are drawn into the static cache.
 		CHECK(shadow_data.static_instances.size() == 2);
@@ -175,7 +178,7 @@ TEST_CASE("[RendererSceneCull] Static shadow casters are split from dynamic ones
 
 		CHECK(shadow_data.use_static_cache);
 		CHECK_FALSE(shadow_data.update_static_cache);
-		CHECK(casters.size() == 3);
+		CHECK(casters.size() == 4);
 		CHECK_MESSAGE(shadow_data.static_instances.size() == 0, "Static casters aren't drawn when the static cache is valid.");
 	}
 
@@ -200,6 +203,9 @@ TEST_CASE("[RendererSceneCull] Static shadow cache invalidation") {
 	RendererSceneCull::Instance dynamic_caster;
 	RendererSceneCull::Instance static_caster;
 	static_caster.shadow_mobility_static = true;
+	RendererSceneCull::Instance static_particles;
+	static_particles.shadow_mobility_static = true;
+	static_particles.base_type = RSE::INSTANCE_PARTICLES;
 
 	CHECK_MESSAGE(light.is_static_shadow_dirty(), "The static cache of a new light must be drawn.");
 
@@ -213,6 +219,10 @@ TEST_CASE("[RendererSceneCull] Static shadow cache invalidation") {
 	light.make_shadow_dirty_for_caster(&dynamic_caster);
 	CHECK(light.is_shadow_dirty());
 	CHECK_FALSE_MESSAGE(light.is_static_shadow_dirty(), "Dynamic casters don't invalidate the static cache.");
+
+	light.make_shadow_dirty_for_caster(&static_particles);
+	CHECK(light.is_shadow_dirty());
+	CHECK_FALSE_MESSAGE(light.is_static_shadow_dirty(), "Particles are dynamic casters, even when marked as static.");
 
 	light.make_shadow_dirty_for_caster(&static_caster);
 	CHECK(light.is_shadow_dirty());

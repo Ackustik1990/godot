@@ -2427,7 +2427,7 @@ void RendererSceneCull::_light_instance_extract_static_shadow_casters(PagedArray
 	uint64_t i = 0;
 	while (i < r_casters.size()) {
 		Instance *instance = r_casters[i];
-		if (!instance->shadow_mobility_static || !((1 << instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK)) {
+		if (!instance->is_static_shadow_caster() || !((1 << instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK)) {
 			i++;
 			continue;
 		}
@@ -3730,9 +3730,12 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 				// Positional shadow static cache: when only dynamic casters changed, update the shadow at most once every
 				// `shadow_dynamic_update_interval` frames (staggered between lights). Other changes update it right away.
+				// The shadow stays dirty until then, so the last change is never lost.
+				const uint64_t frame = Engine::get_singleton()->get_frames_drawn();
 				if (allow_redraw && RSG::light_storage->light_get_shadow_caching(ins->base) && !light->is_static_shadow_dirty()) {
 					const uint64_t interval = RSG::light_storage->light_get_shadow_dynamic_update_interval(ins->base);
-					if (interval > 1 && (Engine::get_singleton()->get_frames_drawn() + ins->self.get_id()) % interval != 0) {
+					// The frame slot alone isn't enough: a viewport that isn't drawn on every frame could keep missing it.
+					if (interval > 1 && (frame + ins->self.get_id()) % interval != 0 && frame - light->last_shadow_update_frame < interval) {
 						allow_redraw = false;
 					}
 				}
@@ -3750,6 +3753,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 				if (allow_redraw) {
 					light->last_version++;
 					light->decrement_shadow_dirty();
+					light->last_shadow_update_frame = frame;
 				}
 			}
 

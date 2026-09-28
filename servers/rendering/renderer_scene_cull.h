@@ -630,6 +630,12 @@ public:
 			memdelete(base_data);
 			memdelete(custom_aabb);
 		}
+
+		// Particles are simulated on the GPU and change every frame without notifying the lights,
+		// so they are always drawn as dynamic shadow casters.
+		_FORCE_INLINE_ bool is_static_shadow_caster() const {
+			return shadow_mobility_static && base_type != RSE::INSTANCE_PARTICLES;
+		}
 	};
 
 	mutable SelfList<Instance>::List _instance_update_list;
@@ -727,6 +733,8 @@ public:
 		uint64_t static_shadow_version = 1;
 		// Last `static_shadow_version` scheduled for rendering.
 		uint64_t static_shadow_version_scheduled = 0;
+		// Frame of the last shadow update, for `RenderingServer::light_set_shadow_dynamic_update_interval()`.
+		uint64_t last_shadow_update_frame = 0;
 
 	private:
 		// Instead of a single dirty flag, we maintain a count
@@ -748,7 +756,7 @@ public:
 		}
 		// A shadow caster changed. Only static casters invalidate the static shadow cache.
 		void make_shadow_dirty_for_caster(const Instance *p_caster) {
-			if (p_caster->shadow_mobility_static) {
+			if (p_caster->is_static_shadow_caster()) {
 				static_shadow_version++;
 			}
 			make_shadow_dirty();
